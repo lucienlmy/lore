@@ -1042,19 +1042,6 @@ pub async fn clone(
             .forward::<CloneError>("Failed to load repository state from remote")?
     };
 
-    let metadata = metadata::Metadata::deserialize(repository.clone(), branch.metadata)
-        .await
-        .forward::<CloneError>("Failed to load repository state from remote")?;
-    let branch_name = branch::name(&metadata).unwrap_or_default();
-    if !branch::exist_local(repository.clone(), branch_id).await {
-        branch::mutable_store_metadata(repository.clone(), branch_id, branch.metadata)
-            .await
-            .forward::<CloneError>("Failed to create local branch")?;
-        branch::store_name_to_id(repository.clone(), branch_id, branch_name)
-            .await
-            .forward::<CloneError>("Failed to create local branch")?;
-    }
-
     let mut revision = if revision.is_zero() {
         if branch.latest.is_zero() {
             if branch_id != repository_metadata.default_branch {
@@ -1138,32 +1125,111 @@ pub async fn clone(
         });
     }
 
-    if !revision.is_zero() {
-        branch::store_latest(
-            repository.clone(),
-            branch_id,
-            revision,
-            BranchLatestStatus::Convergent,
-        )
-        .await
-        .forward::<CloneError>("Failed to create local branch")?;
-        branch::store_last_sync(repository.clone(), branch_id, revision).await;
-    }
+    let (state, metadata) = tokio::try_join!(
+        async {
+            State::deserialize(repository.clone(), revision)
+                .await
+                .forward::<CloneError>("Failed to load revision state")
+        },
+        async {
+            metadata::Metadata::deserialize(repository.clone(), branch.metadata)
+                .await
+                .forward::<CloneError>("Failed to load repository state from remote")
+        }
+    )?;
+
+    let branch_name = branch::name(&metadata).unwrap_or_default().to_string();
+
+    let store_task: tokio::task::JoinHandle<Result<(), CloneError>> = lore_spawn!({
+        let repository = repository.clone();
+        let branch_name = branch_name.clone();
+        let branch_metadata = branch.metadata;
+        async move {
+            if !branch::exist_local(repository.clone(), branch_id).await {
+                branch::mutable_store_metadata(repository.clone(), branch_id, branch_metadata)
+                    .await
+                    .forward::<CloneError>("Failed to create local branch")?;
+                branch::store_name_to_id(repository.clone(), branch_id, branch_name)
+                    .await
+                    .forward::<CloneError>("Failed to create local branch")?;
+            }
+            if !revision.is_zero() {
+                branch::store_latest(
+                    repository.clone(),
+                    branch_id,
+                    revision,
+                    BranchLatestStatus::Convergent,
+                )
+                .await
+                .forward::<CloneError>("Failed to create local branch")?;
+                branch::store_last_sync(repository.clone(), branch_id, revision).await;
+            }
+            Ok::<(), CloneError>(())
+        }
+    });
 
     event::LoreEvent::RepositoryCloneBegin(LoreRepositoryCloneBeginEventData {
         repository: repository.id,
-        branch: LoreString::from(branch_name),
+        branch: LoreString::from(branch_name.as_str()),
         revision,
         path: path.into(),
     })
     .send();
 
-    let state = State::deserialize(repository.clone(), revision)
-        .await
-        .forward::<CloneError>("Failed to load revision state")?;
+    let stats = Arc::new(CloneStats::default());
 
-    // Load the latest state and clone files in view
-    let options = Arc::new(options);
+    let materialize_result = clone_materialize(
+        repository.clone(),
+        state,
+        Arc::new(options),
+        layers,
+        remote.clone(),
+        path,
+        revision,
+        branch_id,
+        stats.clone(),
+    )
+    .await;
+
+    let store_result: Result<(), CloneError> = match store_task.await {
+        Ok(r) => r,
+        Err(e) if e.is_cancelled() => Ok(()),
+        Err(e) => Err(CloneError::internal(format!("Store task failed: {e}"))),
+    };
+
+    let _ = repository.flush(call.sync_data()).await;
+
+    if !call.dry_run() {
+        guard.clean_path_on_drop = false;
+        guard.clean_dotpath_on_drop = false;
+    }
+
+    if let Some(task) = prune_task {
+        let _ = task.await;
+    }
+
+    event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
+        branch: branch_name.into(),
+        revision,
+        count: LoreRepositoryCloneCountData::new(&stats),
+    })
+    .send();
+
+    materialize_result.and(store_result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn clone_materialize(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    options: Arc<CloneOptions>,
+    layers: Option<VirtualLayer>,
+    remote: Arc<lore_transport::Connection>,
+    _path: &Path,
+    revision: Hash,
+    branch_id: crate::lore::BranchId,
+    stats: Arc<CloneStats>,
+) -> Result<(), CloneError> {
     if options.virtually {
         lore_info!("Serving virtualized filesystem at state {revision}");
         if let Some(layer) = layers.as_ref() {
@@ -1175,9 +1241,9 @@ pub async fn clone(
 
         #[cfg(all(target_family = "windows", feature = "vfs"))]
         {
-            //crate::swfs::serve::serve(path, repository.clone(), state);
+            //crate::swfs::serve::serve(_path, repository.clone(), state);
             crate::projfs::serve::serve(
-                path,
+                _path,
                 repository.clone(),
                 state,
                 layers,
@@ -1203,20 +1269,17 @@ pub async fn clone(
         }
     }
 
-    let stats = Arc::new(CloneStats::default());
-    let mut result = Ok(());
+    let mut clone_result = Ok(());
     let mut cache_task = None;
 
     if !options.bare && !revision.is_zero() {
         lore_info!("Pull state {revision}");
-        // Connect to the remote storage
         let correlation_id = execution_context().globals().correlation_id.to_string();
         let _storage = remote
             .session(repository.id, &correlation_id)
             .await
             .forward::<CloneError>("Failed to load repository state from remote")?;
 
-        // Print progress at regular intervals
         let ticker_stats = stats.clone();
         let _ticker = AbortOnDropHandle::new(lore_spawn!({
             async move {
@@ -1236,13 +1299,11 @@ pub async fn clone(
         let cache_repository = repository.clone();
         let cache_state = state.clone();
         cache_task = Some(lore_spawn!(async move {
-            // Ignore errors during caching
             let _ = cache_state.cache_fragments(cache_repository).await;
         }));
 
-        // Reconstruct the local filesystem, reading from immutable store directly into files without caching
-        // payload fragments locally, recursing wide
-        result = clone_in_path(repository.clone(), state, options.clone(), stats.clone()).await;
+        clone_result =
+            clone_in_path(repository.clone(), state, options.clone(), stats.clone()).await;
     }
 
     event::LoreEvent::RepositoryCloneProgress(LoreRepositoryCloneProgressEventData {
@@ -1250,18 +1311,16 @@ pub async fn clone(
     })
     .send();
 
-    if result.is_err() {
+    if clone_result.is_err() {
         execution_context()
             .failure
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Make sure caching has finished
     if let Some(task) = cache_task {
         let _ = task.await;
     }
 
-    // Store the current revision and branch
     crate::instance::store_current_anchor_branch(&repository, branch_id)
         .await
         .forward::<CloneError>("Failed to write current state anchor to repository")?;
@@ -1269,27 +1328,7 @@ pub async fn clone(
         .await
         .forward::<CloneError>("Failed to write current state anchor to repository")?;
 
-    // Flush stores to persist anchor and instance data before the process exits
-    let _ = repository.flush(true).await;
-
-    if !call.dry_run() {
-        guard.clean_path_on_drop = false;
-        guard.clean_dotpath_on_drop = false;
-    }
-
-    // Wait for background prune to finish before returning
-    if let Some(task) = prune_task {
-        let _ = task.await;
-    }
-
-    event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
-        branch: branch_name.into(),
-        revision,
-        count: LoreRepositoryCloneCountData::new(&stats),
-    })
-    .send();
-
-    result
+    clone_result
 }
 
 #[allow(clippy::too_many_arguments)]
