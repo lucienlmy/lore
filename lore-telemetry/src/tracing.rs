@@ -5,6 +5,7 @@ pub mod fields {
     pub const REPOSITORY_ID: &str = "repository_id";
     pub const PARTITION_ID: &str = "partition_id";
     pub const USER_ID: &str = "user_id";
+    pub const USER_AGENT: &str = "user_agent";
     pub const BRANCH_ID: &str = "branch_id";
     pub const REVISION: &str = "revision";
     pub const METADATA: &str = "metadata";

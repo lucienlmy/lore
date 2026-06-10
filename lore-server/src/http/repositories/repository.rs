@@ -8,9 +8,9 @@ use axum::extract::Request;
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::Response;
+use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use serde::Deserialize;
-use tracing::Instrument;
-use tracing::info_span;
+use tracing::Span;
 
 use crate::http::server::ServerState;
 
@@ -20,8 +20,8 @@ struct TracePath {
 }
 
 async fn trace(Path(params): Path<TracePath>, request: Request, next: Next) -> Response {
-    let span = info_span!("http_repository", repository_id = params.repository_id);
-    next.run(request).instrument(span.or_current()).await
+    Span::current().record(REPOSITORY_ID, &params.repository_id);
+    next.run(request).await
 }
 
 pub fn create_router<S>(shared_state: ServerState) -> Router<S> {

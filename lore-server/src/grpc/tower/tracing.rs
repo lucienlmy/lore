@@ -5,6 +5,7 @@ use std::task::Poll;
 use http::Extensions;
 use lore_telemetry::tracing::fields::CORRELATION_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
+use lore_telemetry::tracing::fields::USER_AGENT;
 use lore_telemetry::tracing::fields::USER_ID;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use tonic::body::Body;
@@ -61,7 +62,6 @@ where
         let (metadata, extensions, msg) = grpc_request.into_parts();
 
         let repository_id = repository_id_field(&metadata);
-        let correlation_id = correlation_id_field(&metadata);
         let user_id_present = user_id_from_extensions(&extensions);
 
         let mut output_http_request = http::Request::new(msg);
@@ -71,6 +71,9 @@ where
         *output_http_request.headers_mut() = metadata.into_headers();
         *output_http_request.extensions_mut() = extensions;
 
+        let correlation_id = correlation_id_field(output_http_request.headers());
+        let user_agent = user_agent_field(output_http_request.headers());
+
         let span = tracing::info_span!(
             parent: None,
             "lore_tracing",
@@ -78,6 +81,7 @@ where
             "rpc.service" = rpc_service,
             "rpc.method" = rpc_method,
             { CORRELATION_ID } = correlation_id,
+            { USER_AGENT } = user_agent,
             { REPOSITORY_ID } = repository_id,
             { USER_ID } = tracing::field::Empty,
         );
@@ -109,11 +113,18 @@ fn repository_id_field(metadata: &MetadataMap) -> String {
         .map_or("<no_repo_id>".to_string(), |context| context.to_string())
 }
 
-fn correlation_id_field(metadata: &MetadataMap) -> String {
-    metadata
+fn correlation_id_field(headers: &http::HeaderMap) -> &str {
+    headers
         .get(CORRELATION_ID_HEADER)
         .and_then(|value| value.to_str().ok())
-        .map_or_else(|| "<no_correlation_id>".to_string(), str::to_string)
+        .unwrap_or("<no_correlation_id>")
+}
+
+fn user_agent_field(headers: &http::HeaderMap) -> &str {
+    headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<no_user_agent>")
 }
 
 fn user_id_from_extensions(extensions: &Extensions) -> Option<String> {

@@ -11,7 +11,9 @@ use axum::http::header::AUTHORIZATION;
 use axum::middleware::Next;
 use axum::response::Response;
 use lore_base::types::Context;
+use lore_telemetry::tracing::fields::USER_ID;
 use serde::Deserialize;
+use tracing::Span;
 
 use super::jwt;
 use crate::auth::jwt::AuthorizationToken;
@@ -36,6 +38,7 @@ pub async fn jwt_axum_verify_authorization(
                         .unwrap_or_default()
                         .into();
                 if jwt::verify_authorization(&user_info, repository).is_ok() {
+                    Span::current().record(USER_ID, &user_info.user_id);
                     // Set `user_info` as a request extension so it can be used down the stack
                     request.extensions_mut().insert(Some(user_info));
 

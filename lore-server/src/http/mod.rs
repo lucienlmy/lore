@@ -5,6 +5,7 @@ pub mod presign_token;
 pub mod presigned;
 pub mod repositories;
 pub mod server;
+pub mod tracing;
 
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 pub use server::LoreHttpServer;

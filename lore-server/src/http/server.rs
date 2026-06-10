@@ -25,6 +25,7 @@ use tracing::info;
 
 use super::health_check;
 use super::presigned;
+use super::tracing::lore_http_tracing;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_axum_middleware::jwt_axum_verify_authorization;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
@@ -111,7 +112,6 @@ pub fn create_router(
         ))
         // Do not process request that have more than 10 MiB in the body
         .layer(DefaultBodyLimit::max(shared_state.max_file_size as usize))
-        .layer(CorrelationIdLayerBuilder::new().with_http_tracer().build())
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(settings.request_timeout_seconds),
@@ -140,7 +140,10 @@ pub fn create_router(
         );
     }
 
-    router.layer(HttpMetricsLayer::new())
+    router
+        .layer(middleware::from_fn(lore_http_tracing))
+        .layer(CorrelationIdLayerBuilder::new().with_http_tracer().build())
+        .layer(HttpMetricsLayer::new())
 }
 
 fn build_presign_config(settings: &PresignSettings) -> Result<Option<PresignConfig>> {
