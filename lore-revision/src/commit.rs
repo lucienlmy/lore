@@ -258,7 +258,7 @@ struct CommitStats {
     pub complete: CommitCompleteStats,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CommitOptions {
     /// Message for the main repository (and default for links/layers without a specific message)
     pub message: String,
@@ -275,16 +275,16 @@ pub struct CommitOptions {
     pub layer_messages: HashMap<String, String>,
     /// If set, commit only changes in this layer path
     pub layer: Option<String>,
+    /// Emit a `FragmentWrite` event per stored fragment so callers can report
+    /// write/dedup stats. Off by default to avoid the per-fragment overhead.
+    pub stats: bool,
 }
 
 impl CommitOptions {
     pub fn new(message: String) -> Self {
         Self {
             message,
-            link_messages: HashMap::new(),
-            link: None,
-            layer_messages: HashMap::new(),
-            layer: None,
+            ..Default::default()
         }
     }
 }
@@ -336,6 +336,7 @@ pub async fn commit_impl(
             keys,
             values,
             formats,
+            options.stats,
         )
         .await;
     }
@@ -354,6 +355,7 @@ pub async fn commit_impl(
             keys,
             values,
             formats,
+            options.stats,
         )
         .await;
     }
@@ -431,6 +433,7 @@ pub async fn commit_impl(
     )
     .await?;
 
+    let stats = options.stats;
     let link_messages = Arc::new(options.link_messages);
     let layer_messages = Arc::new(options.layer_messages);
 
@@ -474,6 +477,7 @@ pub async fn commit_impl(
             None,
             link_messages.clone(),
             current_branch,
+            stats,
         )
         .await?;
 
@@ -556,6 +560,7 @@ pub async fn commit_impl(
             },
             Arc::new(HashMap::new()),
             current_branch,
+            stats,
         )
         .await?;
         let layer_branch = layer_state
@@ -599,6 +604,7 @@ pub async fn commit_impl(
 ///
 /// The parent's staged anchor and tree state are NOT modified — layer pins
 /// live in `.urc/layer.toml`, not in the parent's revision tree.
+#[allow(clippy::too_many_arguments)]
 async fn commit_layer_only(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
@@ -607,6 +613,7 @@ async fn commit_layer_only(
     keys: LoreArray<LoreString>,
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
+    stats: bool,
 ) -> Result<Hash, CommitError> {
     // Resolve the layer by target_path against the parent's configured layers.
     // Unlike the auto-bundle path (which falls back to "no layers" on error),
@@ -689,6 +696,7 @@ async fn commit_layer_only(
         },
         Arc::new(HashMap::new()),
         parent_current_branch,
+        stats,
     )
     .await?;
 
@@ -727,6 +735,7 @@ async fn commit_layer_only(
 ///
 /// After committing the link, updates the parent's link pin and stages the parent
 /// state so the updated pin is visible in `lore status`. The parent is not committed.
+#[allow(clippy::too_many_arguments)]
 async fn commit_link_only(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
@@ -735,6 +744,7 @@ async fn commit_link_only(
     keys: LoreArray<LoreString>,
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
+    stats: bool,
 ) -> Result<Hash, CommitError> {
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
@@ -872,6 +882,7 @@ async fn commit_link_only(
         path_remap,
         Arc::new(HashMap::new()),
         link_branch,
+        stats,
     )
     .await?;
 
@@ -1038,6 +1049,7 @@ async fn commit_staged_revision(
     path_remap: Option<(String, String)>,
     link_messages: Arc<HashMap<String, String>>,
     parent_branch: BranchId,
+    stats: bool,
 ) -> Result<Hash, CommitError> {
     let context = execution_context();
     let globals = context.globals();
@@ -1068,7 +1080,7 @@ async fn commit_staged_revision(
     // still wait for spawned leaders to terminate before propagating the
     // error so no task outlives this function holding references to scope-
     // bound resources.
-    let tracker = Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let tracker = immutable::commit_write_tracker(stats);
 
     let work_tracker = tracker.clone();
     let work_result: Result<Hash, CommitError> = async move {
@@ -1484,9 +1496,10 @@ async fn commit_directory(
                 let metadata = metadata.clone();
                 let link_messages = link_messages.clone();
                 let stats = stats.clone();
-                // No tracker passed: commit_link builds its own per-link
-                // tracker so it can drain before emitting the sub-repo's
-                // RevisionCommitRevision event.
+                // commit_link builds its own per-link tracker so it can drain
+                // before emitting the sub-repo's RevisionCommitRevision event;
+                // the parent tracker is passed only to inherit its observer.
+                let parent_tracker = tracker.clone();
                 async move {
                     commit_link_node(
                         repository,
@@ -1500,6 +1513,7 @@ async fn commit_directory(
                         link_messages,
                         stats,
                         parent_branch,
+                        parent_tracker,
                     )
                     .await
                 }
@@ -2034,6 +2048,7 @@ async fn commit_link_node(
     link_messages: Arc<HashMap<String, String>>,
     stats: Arc<CommitStats>,
     parent_branch: BranchId,
+    parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(), CommitError> {
     // First check if this was an initial add of the link
     let block_index = NodeBlock::index(node_id);
@@ -2103,6 +2118,7 @@ async fn commit_link_node(
         signature,
         link_metadata,
         stats,
+        parent_tracker,
     )
     .await?;
 
@@ -2170,13 +2186,14 @@ async fn commit_link(
     current_revision: Hash,
     metadata: Arc<Metadata>,
     stats: Arc<CommitStats>,
+    parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(Hash, NodeID), CommitError> {
     // Per-link tracker: a linked sub-repo is a logically independent commit
     // and must carry its own durability gate. If we reused the parent's
     // tracker, the sub-repo's RevisionCommitRevision would fire before the
     // parent drained — RevisionCommitRevision must only be emitted after
     // tracker.await_all succeeds AND the branch pointer is updated.
-    let link_tracker = Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let link_tracker = Arc::new(parent_tracker.new_like());
 
     let node_path = state
         .node_path(repository.clone(), node_id)

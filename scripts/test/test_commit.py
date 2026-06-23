@@ -293,6 +293,34 @@ def test_commit(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_commit_stats(new_lore_repo):
+    # Commit with --stats finalizes the revision and clears staging.
+    repo: Lore = new_lore_repo()
+
+    seed_file = "seed.txt"
+    with repo.open_file(seed_file, "w+") as output_file:
+        output_file.writelines(["seed\n"])
+    repo.stage(scan=True, offline=True)
+    repo.commit("Seed commit", offline=True)
+    before = int(repo.revision_info(offline=True).revision)
+
+    stats_file = "stats-file.bin"
+    with repo.open_file(stats_file, "w+b") as output_file:
+        output_file.write(os.urandom(512 * 1024))
+    repo.stage(scan=True, offline=True)
+
+    repo.commit("Stats commit", stats=True, offline=True)
+
+    after = int(repo.revision_info(offline=True).revision)
+    assert after == before + 1, "Revision did not advance after --stats commit"
+
+    output = repo.status(unstaged=True, offline=True)
+    assert stats_file not in output, "Staging area not cleared after --stats commit"
+
+    repo.repository_verify(offline=True)
+
+
+@pytest.mark.smoke
 def test_commit_dry_run(new_lore_repo):
     """`commit --dry-run` runs the full pipeline and reports the would-be
     revision, but performs no mutating writes; a subsequent real commit lands."""

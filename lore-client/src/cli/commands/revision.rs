@@ -889,10 +889,18 @@ impl FragmentStats {
                 * (lore_base::types::FRAGMENT_SIZE_THRESHOLD as f64))
                 as usize;
 
-            let count_frac = ((1 + count) as f64) / (max_count as f64);
-            let count_percent = 100.0 * (*count as f64) / (total_written_count as f64);
-            let count_len = 40.0 * count_frac;
-            let stars = "*".to_string().repeat(count_len as usize);
+            let count_len = if max_count == 0 {
+                0
+            } else {
+                let count_frac = ((1 + count) as f64) / (max_count as f64);
+                (40.0 * count_frac).clamp(0.0, 40.0) as usize
+            };
+            let count_percent = if total_written_count == 0 {
+                0.0
+            } else {
+                100.0 * (*count as f64) / (total_written_count as f64)
+            };
+            let stars = "*".repeat(count_len);
             println!(
                 "{start_size:>6} - {end_size:>6}: {stars:<40} ({count:<6}) {count_percent:.2}%"
             );
@@ -1229,6 +1237,7 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
         layer: LoreString::from(args.layer.as_deref().unwrap_or("")),
         layer_paths: LoreArray::from_vec(layer_paths),
         layer_messages: LoreArray::from_vec(layer_msgs),
+        stats: args.stats,
     };
 
     let commit_entry_data: Arc<Mutex<Vec<RevisionEntryData>>> =

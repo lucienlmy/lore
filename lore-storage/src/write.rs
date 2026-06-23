@@ -251,7 +251,8 @@ pub async fn store_fragment(
         )));
     }
 
-    match tracker {
+    let observer = tracker.clone();
+    let result = match tracker {
         None => {
             store_fragment_inline(
                 store,
@@ -279,7 +280,12 @@ pub async fn store_fragment(
             )
             .await
         }
+    };
+
+    if let (Some(tracker), Ok(result)) = (observer, &result) {
+        tracker.notify_fragment(&result.fragment, result.deduplicated);
     }
+    result
 }
 
 /// Backward-compatible synchronous fragment store. Acquires the in-flight
