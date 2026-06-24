@@ -110,7 +110,7 @@ fn handle_lock_acquire(globals: LoreGlobalArgs, args: &FileLockAcquireArgs) -> u
             LoreEvent::LockFileAcquireBegin(data) if data.count > 0 => {
                 let header = if data.ignored != 0 {
                     "Lock already owned on files:"
-                } else if data.dry_run != 0 {
+                } else if globals.dry_run != 0 {
                     "Lock would be acquired on files:"
                 } else {
                     "Lock acquired on files:"
@@ -254,7 +254,7 @@ fn handle_lock_release(globals: LoreGlobalArgs, args: &FileLockReleaseArgs) -> u
                         anstyle::Reset
                     );
                 } else if data.count > 0 {
-                    let header = if data.dry_run != 0 {
+                    let header = if globals.dry_run != 0 {
                         "Lock would be released on files:"
                     } else {
                         "Lock released on files:"

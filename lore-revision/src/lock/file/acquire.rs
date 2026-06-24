@@ -103,8 +103,6 @@ impl EventError for AcquireError {
 pub struct LoreLockFileAcquireBeginEventData {
     /// Number of acquire entries that follow.
     pub count: u64,
-    /// Whether this is a dry-run preview.
-    pub dry_run: u8,
     /// Whether the entries that follow were already owned.
     pub ignored: u8,
 }
@@ -194,7 +192,6 @@ pub async fn acquire(
 
         event::LoreEvent::LockFileAcquireBegin(LoreLockFileAcquireBeginEventData {
             count: paths.len() as u64,
-            dry_run: 1,
             ignored: 0,
         })
         .send();
@@ -299,7 +296,6 @@ pub async fn acquire(
     if !locks.is_empty() {
         event::LoreEvent::LockFileAcquireBegin(LoreLockFileAcquireBeginEventData {
             count: locks.len() as u64,
-            dry_run: 0,
             ignored: 0,
         })
         .send();
@@ -318,7 +314,6 @@ pub async fn acquire(
     if !resources.is_empty() {
         event::LoreEvent::LockFileAcquireBegin(LoreLockFileAcquireBeginEventData {
             count: resources.len() as u64,
-            dry_run: 0,
             ignored: 1,
         })
         .send();

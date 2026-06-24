@@ -1481,8 +1481,6 @@ typedef struct lore_link_entry_event_data_t {
 typedef struct lore_lock_file_acquire_begin_event_data_t {
   // Number of acquire entries that follow.
   uint64_t count;
-  // Whether this is a dry-run preview.
-  uint8_t dry_run;
   // Whether the entries that follow were already owned.
   uint8_t ignored;
 } lore_lock_file_acquire_begin_event_data_t;
@@ -1531,8 +1529,6 @@ typedef struct lore_lock_file_query_event_data_t {
 typedef struct lore_lock_file_release_begin_event_data_t {
   // Number of release entries that follow.
   uint64_t count;
-  // Whether this is a dry-run preview.
-  uint8_t dry_run;
   // Whether no matching lock was found to release.
   uint8_t not_found;
 } lore_lock_file_release_begin_event_data_t;

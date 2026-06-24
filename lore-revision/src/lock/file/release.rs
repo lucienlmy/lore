@@ -102,8 +102,6 @@ impl EventError for ReleaseError {
 pub struct LoreLockFileReleaseBeginEventData {
     /// Number of release entries that follow.
     pub count: u64,
-    /// Whether this is a dry-run preview.
-    pub dry_run: u8,
     /// Whether no matching lock was found to release.
     pub not_found: u8,
 }
@@ -242,7 +240,6 @@ pub async fn release(
 
         event::LoreEvent::LockFileReleaseBegin(LoreLockFileReleaseBeginEventData {
             count: paths.len() as u64,
-            dry_run: 1,
             not_found: 0,
         })
         .send();
@@ -319,7 +316,6 @@ pub async fn release(
     if unlocks.is_empty() {
         event::LoreEvent::LockFileReleaseBegin(LoreLockFileReleaseBeginEventData {
             count: 0,
-            dry_run: 0,
             not_found: 1,
         })
         .send();
@@ -331,7 +327,6 @@ pub async fn release(
         lore_debug!("Unlocked {} path(s)", unlocks.len());
         event::LoreEvent::LockFileReleaseBegin(LoreLockFileReleaseBeginEventData {
             count: unlocks.len() as u64,
-            dry_run: 0,
             not_found: 0,
         })
         .send();
