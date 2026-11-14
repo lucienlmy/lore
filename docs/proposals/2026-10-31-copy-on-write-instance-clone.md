@@ -3,27 +3,28 @@ lep: 2026-10-31-copy-on-write-instance-clone
 title: Copy-on-write instance clone
 authors:
   - Zack Neyland
-status: Draft
+status: Accepted
 created: 2026-10-31
-updated: 2026-11-10
+updated: 2026-11-14
 ---
 
 # Copy-on-write instance clone
 
 ## Summary
 
-This proposal lets one machine hold many working trees of a very large repository at little extra disk
-cost. `lore repository instance clone <destination>` copies an instance to a new path as a copy-on-write
-clone, so the copy shares the source's data blocks, and registers the copy as an instance of its own on the
-same revision. Where `lore clone` makes an instance from a remote, an instance clone makes one from an
-instance already on the machine. The instance's filesystem provider decides how the clone is made: it answers,
-before anything is written, whether a clone between two paths would share blocks, copy bytes or is
-unsupported, and it performs the clone through one clone backend per filesystem, so a new filesystem, OS or
-virtual provider adds one backend. The clone refuses when it cannot share blocks, unless the user opts into a
-full copy with `--allow-copy`. It depends on
-[instance-local modified-time records](2026-11-03-instance-local-modified-time-records.md), so the copy
-starts with valid records, and on [resumable sync](2026-11-03-resumable-sync.md), whose record
-of an unfinished sync tells the clone when the source is mid-sync.
+This proposal lets one machine hold many working trees of a very large repository at little extra disk cost.
+`lore repository instance clone <destination>` copies an instance to a new path as a copy-on-write clone, so
+the copy shares the source's data blocks, and registers the copy as an instance of its own on the same
+revision. Where `lore clone` makes an instance from a remote, an instance clone makes one from an instance
+already on the machine. The instance's filesystem provider decides how the clone is made: it answers, before
+anything is written, whether a clone between two paths would share blocks, copy bytes or is unsupported, and
+it performs the clone through one clone backend per filesystem, so a new filesystem, OS or virtual provider
+adds one backend. The clone refuses when it cannot share blocks, unless the user opts into a full copy with
+`--allow-copy`. Cloning a FUSE virtual clone copies only its local changes and its Lore directory, whose
+modified-time records hold the times its mount reports. It depends on [instance-local modified-time
+records](2026-11-03-instance-local-modified-time-records.md), so the copy starts with valid records, and on
+[resumable sync](2026-11-03-resumable-sync.md), whose record of an unfinished sync tells the clone when the
+source is mid-sync.
 
 ## Motivation
 
@@ -45,6 +46,9 @@ of its own.
   has no registration, so Lore treats it as the source.
 - **A copied directory hashes every file on its first scan,** because its modified-time records name the
   source's instance ID, so none apply to the copy. On the measured tree that is a read of about 456 GB.
+- **A virtual instance cannot be copied cheaply.** Copying its mount reads the whole tree from the store, and
+  a copy of its external directory carries the source's ID, while the times its syncs recorded stay behind
+  under keys named by that ID (v0.14.0's `RecordedTimes` in `lore-revision/src/fs/fuse/attr.rs`).
 - **What block cloning costs depends on the filesystem, not the OS.** APFS, Btrfs, XFS, bcachefs, ReFS and
   Dev Drive share blocks; NTFS and ext4 do not, and no filesystem shares blocks across volumes. One Windows
   machine can hold an NTFS system drive and a Dev Drive side by side. Where a clone cannot share blocks it is
@@ -145,7 +149,8 @@ next to `instance list`, `move`, `prune` and `delete`
   removes any file, and the deregistration takes these locks, so a delete waits for the clone. See Lock hold.
 - **Writes into an in-progress directory** beside the destination, gives the copy the source's anchors,
   renames the directory to the destination, and then registers it. No registration names the destination
-  before the clone is there; see Interrupted clones.
+  before the clone is there; see Interrupted clones. A virtual clone's copy is its external directory
+  instead, as Virtual instances describes.
 - **Refuses** a destination that exists, lies inside an instance or has no parent directory, a source with an
   unfinished sync (by the record resumable sync keeps, once that proposal lands), and a source on a local
   store.
@@ -237,6 +242,42 @@ overlay's size.
 Until SWFS implements this, its provider answers *unsupported* ("this virtual filesystem provider cannot
 clone instances yet") and the clone refuses. (Goal 3, Goal 5.)
 
+The FUSE provider ([`lore-fuse`](../../lore-fuse/README.md)), which serves virtual clones on Linux, does
+this. A virtual clone keeps its `.lore`, its local files (`write/`) and its deletion list in its external
+instance directory, `external/<instance ID>/` in Lore's global data directory, and its mount builds the
+working tree from the revision, the deletion list and the local files. Every external directory is on that one
+volume, whatever the destination, where the new instance only takes its mount point. Cloning a virtual clone,
+the provider (Goal 3, Goal 5):
+
+- **Answers** by probing from the source's Lore directory into the directory that holds the external
+  directories. Where no backend shares blocks, it measures the local files, the Lore directory and the
+  deletion list, against that volume's free space.
+- **Copies** the external directory under the new instance ID, leaving out what cloning an on-disk instance
+  leaves out of the Lore directory, the writes still under way, and Lore directories and nested repositories
+  among the local files. A deletion list copied during an append can end inside a line, which the mount drops,
+  as it drops one a crash cut short.
+- **Carries the times its mount reports.** A virtual clone's mount reports, for each file it serves from the
+  store, the time the instance's modified-time records hold for the path: the time of the *swap*, the step
+  that puts a sync's or switch's revision in place in the mount, that changed the path, or the time a commit
+  read for a file it stored. A path with no record reports the instance's *base time*, kept in its
+  configuration and set when the first instance of its line was created. Cloning copies both, so the new
+  instance reports the source's times; without them it would report the base time for every path a swap
+  changed, older than the source reports, and a build tool comparing them with its outputs could skip a
+  rebuild the source needs. [Instance-local modified-time
+  records](2026-11-03-instance-local-modified-time-records.md) describes the records a virtual clone keeps.
+- **Places** the new instance so that no registration names the destination before its mount point exists
+  there, and so that a crash at any point leaves either an instance a service start mounts, or files a service
+  start removes and the new instance's anchor keys, as a crash while cloning an on-disk instance leaves them.
+  It marks the copy's Lore directory as being cloned, naming the destination, before it copies anything, and
+  holds the lock of the new instance's external directory from the plan to the finish. A service that starts
+  removes an external directory left marked whose instance no store registers, with the empty mount point its
+  mark names, and removes only the mark of one a store registers, which it mounts; it passes over one whose
+  lock another holds.
+- **Lets the source serve** throughout. The copy takes or misses each write made through the source's mount
+  while cloning runs, as copying an on-disk instance does a file written meanwhile, and the new instance
+  mounts what was copied: local files win over the deletion list at mount, so any combination of the two
+  builds a tree. A move of the source waits until cloning ends.
+
 ### Copy is opt-in
 
 A full copy of a 1 TB tree takes hours and holds the store's locks throughout, so the clone never makes one
@@ -245,11 +286,13 @@ unasked (Goal 4).
 - **Without `--allow-copy`**, a clone whose answer is *copies bytes* or *unsupported* refuses before writing
   anything. The message names the source's and destination's filesystems and volumes and the remedy: put
   the instances on a filesystem that clones (Dev Drive or ReFS on Windows, APFS on macOS, Btrfs, XFS or
-  bcachefs on Linux) and the destination on the same volume as the source. For *copies bytes*, it also says what
-  `--allow-copy` would cost.
+  bcachefs on Linux) and the destination on the same volume as the source; for a virtual clone, put Lore's
+  global data directory, where the copy goes, on such a filesystem. For *copies bytes*, it also says
+  what `--allow-copy` would cost.
 - **With `--allow-copy`**, the clone states before it starts that it will copy N GB in M files and hold the
-  store's locks throughout, so Lore commands wait for it as Lock hold describes. It
-  refuses when the destination's free space is below the bytes it would copy.
+  store's locks throughout, so Lore commands wait for it as Lock hold describes. It refuses when the free
+  space of the volume it copies to, the destination's or, for a virtual clone, the global data directory's, is
+  below the bytes it would copy.
 - When the backend shares blocks, `--allow-copy` only lets the clone copy the entries that turn out not to
   clone. It does nothing for *unsupported*, which always refuses.
 
@@ -304,7 +347,8 @@ power loss before the rename leaves the directory and the clone's anchor keys, w
 clone to the same destination removes a directory with that name only when it carries the mark, so it removes
 only what a clone wrote, and a removal cut short is finished by the next clone; it leaves anything else beside
 the destination alone. A crash after the rename leaves a working instance that registers itself when a write
-command next opens it.
+command next opens it. Cloning a virtual clone writes no directory beside the destination, and a service that
+starts finishes or removes what it left, as Virtual instances describes.
 
 ## Compatibility
 
@@ -317,10 +361,14 @@ command next opens it.
   connection without sending a result" (`lore/src/remote/call.rs`). The handshake
   [ADR-00025](../developing/decisions/00025-service-version-compatibility.md) proposes would turn that into a
   clear refusal.
-- **On-disk format** — N/A: a clone writes the same files and store keys as any instance. The in-progress
-  directory is a sibling of the destination, not part of any instance. The in-progress mark, which a crash
-  between the rename and its removal can leave in an instance's Lore directory, is a file older clients
-  ignore.
+- **On-disk format** — Cloning an on-disk instance writes the same files and store keys as any instance.
+  The in-progress directory is a sibling of the destination, not part of any instance. The in-progress mark,
+  which a crash between the rename and its removal can leave in an instance's Lore directory, is a file older
+  clients ignore. Cloning a virtual clone writes the new instance's own external directory, with a lock file
+  beside it and a mark that holds the destination's path.
+- **FUSE times** — Cloning a virtual clone carries the times its mount reports in the modified-time records
+  it copies; [instance-local modified-time records](2026-11-03-instance-local-modified-time-records.md) covers
+  their format and what an older client reads.
 - **CLI and public API** — New: `lore repository instance clone <destination> [--allow-copy]`, which prints
   the new instance's path and ID and exits 0, or names the refusal (no block sharing, unsupported provider,
   not enough space, and the existing destination and source checks) and exits non-zero as other instance
@@ -339,8 +387,10 @@ command next opens it.
   store waits that long for its next command. Before the locks are taken, the clone probes the pair, writing a
   probe file in the source's Lore directory and its clone in the destination's parent, checks the space, takes
   the in-progress directory's lock file beside the destination, and removes directories that earlier
-  interrupted clones left there. Builds and editors in the source are not Lore commands and can still write
-  during the clone; see Risks.
+  interrupted clones left there. Cloning a virtual clone probes into the directory that holds the external
+  directories and takes the lock file beside the new instance's external directory there; a service that
+  starts removes what an interrupted cloning of a virtual clone left. Builds and editors in the source are not
+  Lore commands and can still write during the clone; see Risks.
 - **Memory** — Preserved: the clone walks the tree without holding it; the filesystem does the copying.
 - **Threads** — The walk runs on the calling thread and on threads lent from the syscall pool's cap, at
   most half of it, so the clone never takes the threads every other file operation in the process runs on,
@@ -366,7 +416,12 @@ command next opens it.
 
 ## Migration Plan
 
-N/A — no breaking changes, no migration required.
+No migration step. An instance cloned from an on-disk instance needs none after a downgrade either. An
+instance cloned from a virtual clone needs a clean build after a downgrade to v0.14.0: v0.14.0 reads the times
+its mount reports only from the mutable store, under the new instance's ID, where nothing holds any, so every
+path reports the base time, older than the content its source took from its swaps. v0.14.0 does not clone
+virtual clones. The times a virtual clone's mount reports otherwise follow [instance-local modified-time
+records](2026-11-03-instance-local-modified-time-records.md#migration-plan).
 
 ## Security Considerations
 
@@ -378,7 +433,9 @@ Windows it reads each entry by path, and holds each directory it lists open with
 a rename or removal of that directory, or of one above it, is refused until the directory is listed. So a
 crafted tree cannot make the clone read or write outside the source and the destination, and the destination
 checks run on the destination's resolved parent. The probe writes one small file in the source's Lore
-directory and clones it into the destination's parent, with the same permissions, and removes both.
+directory and clones it into the destination's parent, with the same permissions, and removes both. Cloning a
+virtual clone writes, and probes, the directory of external directories in Lore's global data directory
+instead, which the user owns, and makes only the mount point at the destination.
 
 ## Privacy Considerations
 
@@ -419,6 +476,15 @@ No new data leaves the machine. A clone registers its path in the shared store, 
   copying those entries silently, unless `--allow-copy` was given.
 - **Risk:** binaries a build made in the source point their debug information at the source's object
   files until relinked — *mitigation:* accepted; it affects build tools, not Lore.
+- **Risk:** cloning a virtual clone stops between the new instance's mount point and its registration —
+  *mitigation:* the mark names the destination, and a service that starts removes the new instance and the
+  empty mount point. The next start mounts a new instance that cloning stopped after registering and before
+  mounting. *Accepted:* as when cloning an on-disk instance, a crash leaves the new instance's three anchor
+  keys in the store.
+- **Risk:** a second service starts over the same global data directory while a virtual clone is cloned, and
+  removes the new instance as one an interrupted cloning left — *mitigation:* cloning holds the new instance's
+  external directory's lock from the plan to the finish, and a starting service passes over a locked
+  directory.
 - **Risk:** the clone waits for as long as other commands in its process, such as the service's, keep sharing
   the source's lock — *mitigation:* accepted; making new commands queue behind a waiting clone would deadlock
   a command that opens the same instance twice, and each such command finishes on its own.
@@ -472,6 +538,26 @@ it and copies the source's anchors.
 taken during a sync holds files of revision A while the anchors it adopts name revision B. Its copied
 records vouch for the revision-A files' times, so the first scan skips them and status reports the tree as
 clean at revision B while it is not.
+
+### Keep the swap times in the store and write the source's under the new instance's keys
+
+v0.14.0 kept a virtual clone's swap times in the mutable store, under keys named by the instance. Cloning
+could read every swap time the source holds there and write it again under the new instance's ID, under the
+exclusive lock.
+
+*Rejected because:* the store's keys are hashes, so cloning would look up every path of the tree, which for
+a virtual clone means loading node blocks it may not hold, to copy the few a swap changed: the cost grows
+with the tree, not with the local changes, as copying the source's records into the store, below, does for
+the records.
+
+### Read the source's swap times in place
+
+With the swap times in the store, the new instance could fall back to the keys of the instance it was cloned
+from.
+
+*Rejected because:* the source keeps recording times there as it syncs, so the new instance would report times
+for content it does not hold, and each line of instances cloned from one another would read one more
+instance's keys per lookup.
 
 ### Copy the source's records into the store for the clone
 

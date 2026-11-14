@@ -2145,6 +2145,114 @@ async fn host_content(operation: &FuseOperation, at: &str) -> Vec<u8> {
     std::fs::read(file).expect("the host file reads")
 }
 
+/// The time the mutable store holds for `path` under the instance's modified-time key, which a
+/// context holding no records reads as its recorded time; 0 for none.
+async fn store_recorded_time(w: &Working, path: &RelativePath) -> u64 {
+    lore_revision::state::stored_modified_time(
+        &w.repository,
+        lore_revision::state::file_modified_time_key(
+            w.repository.salt(),
+            w.repository.instance_id,
+            path,
+        ),
+    )
+    .await
+}
+
+/// A virtual clone tells a file from its node by address and content, never by a recorded time:
+/// a local file of the node's size, whose time is the one recorded for its path, compares as
+/// modified, and a tracked file that compares as unmodified has no time recorded for it, even by
+/// a context that could write one.
+#[tokio::test]
+async fn a_virtual_clone_compares_files_by_content_never_by_a_recorded_time() {
+    in_context(async {
+        let w = working(FIXTURE).await;
+        let operation = InstanceOperationImpl::new(
+            StaticDispatchInstanceOperation::Fuse(FuseOperation::new(w.fs.clone())),
+            true,
+        );
+        let node_at = async |at: &RelativePath| {
+            w.current
+                .find_node(w.repository.clone(), at.as_str())
+                .await
+                .expect("the committed node")
+        };
+        let a = lookup_ino(&w.fs, ROOT_INO, "a.txt").await.expect("a.txt");
+        write_all(&w.fs, a, 0, 0, b"ALPHA").await;
+        let written = path("a.txt");
+        let info = operation.file_info(&written).await.expect("info");
+        let node = node_at(&written).await;
+        assert_eq!(info.size(), node.size, "the edit keeps the size");
+        w.mutable
+            .clone()
+            .store(
+                w.repository.root_id(),
+                lore_revision::state::file_modified_time_key(
+                    w.repository.salt(),
+                    w.repository.instance_id,
+                    &written,
+                ),
+                lore_base::types::Hash::from_u64(info.mtime()),
+                lore_base::types::KeyType::Untyped,
+            )
+            .await
+            .expect("record the file's time");
+        assert_eq!(store_recorded_time(&w, &written).await, info.mtime());
+        let compared = lore_revision::state::file_modification(
+            w.repository.clone(),
+            &node,
+            info.mtime(),
+            info.size(),
+            &written,
+            false,
+            &operation,
+            &lore_storage::ContentHashes::default(),
+        )
+        .await
+        .expect("compare the written file");
+        assert!(
+            matches!(
+                compared,
+                lore_revision::state::FileModification::ModifiedByHash
+            ),
+            "compared by content"
+        );
+
+        let tracked = path("dir/c.txt");
+        let info = operation.file_info(&tracked).await.expect("info");
+        let before = store_recorded_time(&w, &tracked).await;
+        assert_ne!(before, info.mtime(), "a time recorded now would show");
+        let token = RepositoryWriteToken::acquire(&w.path).await;
+        let writing = Arc::new(
+            w.repository
+                .without_command_locks()
+                .with_write_token(token.share()),
+        );
+        let compared = lore_revision::state::file_modified_against_node(
+            writing,
+            &node_at(&tracked).await,
+            info.mtime(),
+            info.size(),
+            &tracked,
+            true,
+            &operation,
+            &lore_storage::ContentHashes::default(),
+        )
+        .await
+        .expect("compare the tracked file");
+        assert!(matches!(
+            compared,
+            lore_revision::state::FileModification::UnmodifiedByHash
+        ));
+        assert_eq!(
+            store_recorded_time(&w, &tracked).await,
+            before,
+            "no time is recorded"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn the_operation_reads_local_content_from_write() {
     let w = working(FIXTURE).await;

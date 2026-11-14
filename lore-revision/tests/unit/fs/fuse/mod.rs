@@ -6,6 +6,7 @@ mod allocations;
 mod attr;
 mod bench;
 mod clock;
+mod clone;
 mod counts;
 mod deletions;
 mod discover;

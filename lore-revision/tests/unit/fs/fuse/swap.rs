@@ -209,8 +209,12 @@ impl Swapping {
         self.fs.getattr(&req(), ino).await.expect("getattr").attr
     }
 
-    async fn stored_time(&self, name: &str) -> u64 {
-        state::file_modified_time(self.repository(), &path(name)).await
+    /// The time the mount's records hold for `name`, 0 for none.
+    async fn recorded_time(&self, name: &str) -> u64 {
+        self.fs
+            .recorded_times()
+            .mtime_for(&self.repository(), &path(name), 0)
+            .await
     }
 
     /// The time a swap of this read-only mount started now would record
@@ -267,25 +271,19 @@ async fn swap_records_modified_time_for_each_added_or_modified_file() {
             let second = s
                 .commit(&[("a.txt", Some(b"two")), ("new.txt", Some(b"new"))])
                 .await;
-            // Read after this commit, which can record the time the first one left out for a
-            // file written in its clock tick, so that only the swap can change it.
-            let keep_before = s.stored_time("keep.txt").await;
+            let keep_before = s.recorded_time("keep.txt").await;
             let before = s.time_before_next_write().await;
             s.swap_to(&second, Arc::new(RecordingSink::default())).await;
             let after = s.time_before_next_write().await;
 
-            s.operation
-                .take_modified_times()
-                .store(s.repository())
-                .await;
             for name in ["a.txt", "new.txt"] {
-                let recorded = s.stored_time(name).await;
+                let recorded = s.recorded_time(name).await;
                 assert!(
                     (before..=after).contains(&recorded),
                     "{name}: {recorded} not in {before}..={after}"
                 );
             }
-            assert_eq!(s.stored_time("keep.txt").await, keep_before);
+            assert_eq!(s.recorded_time("keep.txt").await, keep_before);
         },
     )
     .await;
@@ -575,7 +573,7 @@ async fn swap_records_modified_time_for_directories_whose_entry_set_changed() {
                 ])
                 .await;
 
-            let same_before = s.stored_time("same").await;
+            let same_before = s.recorded_time("same").await;
             let before = s.time_before_next_write().await;
             let sink = Arc::new(RecordingSink::default());
             s.swap_to(&second, sink.clone()).await;
@@ -592,19 +590,15 @@ async fn swap_records_modified_time_for_directories_whose_entry_set_changed() {
             assert_eq!(s.getattr(same).await.mtime, same_mtime);
             assert!(!sink.has(&Call::Inode(same)));
 
-            s.operation
-                .take_modified_times()
-                .store(s.repository())
-                .await;
             for name in ["dir", "other"] {
-                let recorded = s.stored_time(name).await;
+                let recorded = s.recorded_time(name).await;
                 assert!(
                     (before..=after).contains(&recorded),
                     "{name}: {recorded} not in {before}..={after}"
                 );
             }
             assert_eq!(
-                s.stored_time("same").await,
+                s.recorded_time("same").await,
                 same_before,
                 "a directory whose entries did not change keeps its time"
             );
@@ -862,10 +856,6 @@ async fn a_remounted_provider_reports_the_times_an_earlier_swap_recorded() {
                 .await
                 .expect("info")
                 .mtime();
-            s.operation
-                .take_modified_times()
-                .store(s.repository())
-                .await;
 
             let fs = FuseFilesystem::new(s.repository(), second.clone(), attr_context())
                 .await
@@ -887,7 +877,8 @@ async fn a_remounted_provider_reports_the_times_an_earlier_swap_recorded() {
                 .await
                 .expect("lookup file");
             assert_eq!(file.attr.mtime, changed.mtime() / 1000);
-            // The fixture's commits stored scan times for every file; only a swap's count.
+            // The fixture's commits stored their times in the mutable store, which a mount over a
+            // Lore directory does not read.
             let kept = operation
                 .file_info(&path("dir/keep.txt"))
                 .await
@@ -930,10 +921,10 @@ async fn a_failed_time_store_leaves_the_served_state_unchanged() {
     .await;
 }
 
-/// The marker that opens the store to lookups is written only by a swap that changed a file or a
-/// directory's entries.
+/// Only a swap that changed a file or a directory's entries records a time, which opens the
+/// lookups of times, in the mount and in a later one.
 #[tokio::test]
-async fn only_a_swap_that_changes_something_writes_the_marker() {
+async fn only_a_swap_that_changes_something_records_a_time() {
     swapping(&[("a.txt", b"one")], async |s: Swapping| {
         s.swap_to(&s.first.clone(), Arc::new(RecordingSink::default()))
             .await;
@@ -1564,6 +1555,23 @@ impl MutableStore for GatedStore {
     }
 }
 
+/// Stores the marker a swap stores in the mutable store over a context without a Lore directory
+/// for the instance `repository` serves, so a provider over such a context reads the store for
+/// every new inode's time.
+async fn mark_times_stored(repository: &RepositoryContext) {
+    repository
+        .try_write_mutable_store()
+        .expect("write token")
+        .store(
+            repository.root_id(),
+            lore_revision::fs::fuse::attr::marker_key(repository),
+            lore_base::types::Hash::from_u64(1),
+            lore_base::types::KeyType::Untyped,
+        )
+        .await
+        .expect("store the marker");
+}
+
 /// A swap that runs between two entries of one READDIRPLUS page, while the page waits on the
 /// store for a new inode's time: neither entry puts the content from before the swap in an
 /// inode, and the page goes plain from the entry refused.
@@ -1575,6 +1583,7 @@ async fn a_swap_between_two_entries_of_a_readdirplus_page_leaves_no_old_content(
             let second = s.commit(&[("c.txt", Some(b"sea"))]).await;
             s.swap_to(&second, Arc::new(RecordingSink::default())).await;
             let repository = s.repository();
+            mark_times_stored(&repository).await;
             let gate = Arc::new(GatedStore {
                 inner: repository.try_mutable_store_arc().expect("write token"),
                 armed: AtomicBool::new(false),
@@ -1586,7 +1595,6 @@ async fn a_swap_between_two_entries_of_a_readdirplus_page_leaves_no_old_content(
                     repository.immutable_store(),
                     gate.clone(),
                 )
-                .with_path(&s.instance.path)
                 .with_id(repository.id)
                 .with_instance_id(repository.instance_id),
             ));
@@ -1700,6 +1708,7 @@ async fn an_interrupted_readdirplus_gives_back_the_rows_it_counted() {
             let second = s.commit(&[("c.txt", Some(b"sea"))]).await;
             s.swap_to(&second, Arc::new(RecordingSink::default())).await;
             let repository = s.repository();
+            mark_times_stored(&repository).await;
             let gate = Arc::new(GatedStore {
                 inner: repository.try_mutable_store_arc().expect("write token"),
                 armed: AtomicBool::new(false),
@@ -1711,7 +1720,6 @@ async fn an_interrupted_readdirplus_gives_back_the_rows_it_counted() {
                     repository.immutable_store(),
                     gate.clone(),
                 )
-                .with_path(&s.instance.path)
                 .with_id(repository.id)
                 .with_instance_id(repository.instance_id),
             ));
@@ -1904,6 +1912,7 @@ async fn a_swap_landing_mid_page_makes_every_row_after_it_plain() {
             let second = s.commit(&[("g.txt", Some(b"gee"))]).await;
             s.swap_to(&second, Arc::new(RecordingSink::default())).await;
             let repository = s.repository();
+            mark_times_stored(&repository).await;
             let gate = Arc::new(GatedStore {
                 inner: repository.try_mutable_store_arc().expect("write token"),
                 armed: AtomicBool::new(false),
@@ -1915,7 +1924,6 @@ async fn a_swap_landing_mid_page_makes_every_row_after_it_plain() {
                     repository.immutable_store(),
                     gate.clone(),
                 )
-                .with_path(&s.instance.path)
                 .with_id(repository.id)
                 .with_instance_id(repository.instance_id),
             ));
@@ -4034,7 +4042,9 @@ async fn a_file_a_failed_apply_rewrote_is_invalidated_whatever_its_inode_holds()
 }
 
 /// A lookup that read a file, then waited on the store while a swap replaced its content, does
-/// not revive the orphan holding what it read.
+/// not revive the orphan holding what it read. The provider is served over a context without a
+/// Lore directory, which keeps its swap times in the gated store, so the lookup waits there for the
+/// time a swap recorded.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_orphan_is_not_revived_across_a_swap_that_replaced_its_content() {
     swapping(
@@ -4053,7 +4063,6 @@ async fn an_orphan_is_not_revived_across_a_swap_that_replaced_its_content() {
                         repository.immutable_store(),
                         gate.clone(),
                     )
-                    .with_path(&s.instance.path)
                     .with_id(repository.id)
                     .with_instance_id(repository.instance_id),
                 )

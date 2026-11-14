@@ -435,42 +435,12 @@ enum FileSource {
 }
 
 /// What the host entry at `host` holds, read through a symbolic link as a path named on its
-/// own is ([`host_file_info`]).
+/// own is.
 async fn host_info(host: &Path) -> std::io::Result<FileInfo> {
     match lore_io::IoDriver::global().metadata(host).await {
-        Ok(metadata) => Ok(host_file_info(&metadata)),
+        Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
         Err(error) => Err(error),
-    }
-}
-
-/// [`FileInfo::from_metadata`], a host file's time the later of its modification and its status
-/// change, in milliseconds. A file renamed onto a name, created at it, or given a time carries
-/// that change's time, so it never matches a time recorded for the file the name held before,
-/// whatever its own modification time. Commits and scans record and compare this time; no
-/// served attribute reads it ([`crate::fs::fuse::attr::RecordedTimes`]).
-fn host_file_info(metadata: &std::fs::Metadata) -> FileInfo {
-    use std::os::unix::fs::MetadataExt as _;
-
-    match FileInfo::from_metadata(metadata) {
-        FileInfo::File {
-            executable,
-            size,
-            mtime,
-        } => {
-            let changed = u64::try_from(metadata.ctime())
-                .unwrap_or_default()
-                .saturating_mul(1000)
-                .saturating_add(
-                    u64::try_from(metadata.ctime_nsec()).unwrap_or_default() / 1_000_000,
-                );
-            FileInfo::File {
-                executable,
-                size,
-                mtime: mtime.max(changed),
-            }
-        }
-        info => info,
     }
 }
 

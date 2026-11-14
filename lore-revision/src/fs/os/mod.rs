@@ -7,7 +7,7 @@
 //! the operation is built on sit here with it, reaching the driver for this provider alone.
 
 #[cfg(not(feature = "test-util"))]
-mod clone;
+pub(crate) mod clone;
 #[cfg(feature = "test-util")]
 pub mod clone;
 

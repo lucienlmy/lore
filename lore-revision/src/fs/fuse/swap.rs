@@ -515,9 +515,8 @@ async fn swap_through(
 
     // The time is recorded for content served from the store. A copy-up later stamps the
     // content's host file in the staging directory and moves it under `write/`, so the time is
-    // probed there: an edit of the same size compares as unchanged where the host file's stamp
-    // matches it. A read-only mount writes no host file, so its time is probed in the dot
-    // directory.
+    // probed there: a file written after the swap reports a later time than the swap's. A
+    // read-only mount writes no host file, so its time is probed in the dot directory.
     let probe_dir = match fs.local_files() {
         Some(local) => Some(local.staging_dir()),
         None => repository.dot_dir_path().ok(),
@@ -532,18 +531,13 @@ async fn swap_through(
     }
     directories.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
     directories.dedup_by(|a, b| a.as_str() == b.as_str());
-    let recorded = || {
-        applied
-            .iter()
-            .filter(|change| writes_file(change))
-            .map(NodeChange::path)
-            .chain(directories.iter())
-    };
-    for path in recorded() {
-        operation.record_modified_time(&repository, path, now);
-    }
+    let recorded = applied
+        .iter()
+        .filter(|change| writes_file(change))
+        .map(NodeChange::path)
+        .chain(directories.iter());
     fs.recorded_times()
-        .store(&repository, recorded(), now)
+        .store(&repository, recorded, now)
         .await?;
 
     fs.mark_published();

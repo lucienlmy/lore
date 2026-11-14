@@ -87,7 +87,7 @@ async fn in_context(test: impl std::future::Future<Output = ()>) {
 /// Writes back `records`, which must succeed.
 async fn write_back(records: &Arc<InstanceRecords>, token: &RepositoryWriteToken) {
     records
-        .write_back(token, ())
+        .write_back(token, false, ())
         .await
         .expect("write back the records");
 }
@@ -117,6 +117,89 @@ async fn records_written_back_are_read_by_the_next_holder() {
             shard_file(FORMAT_VERSION, &[(key(1, 1), 100)]),
             "the header, then the records sorted by key, with the removed one left out"
         );
+    })
+    .await;
+}
+
+/// Records tell from their directory's listing alone whether it holds a shard: the mark, a
+/// temporary file and a directory that does not exist hold none.
+#[tokio::test]
+async fn records_tell_from_the_listing_whether_the_directory_holds_a_shard() {
+    in_context(async {
+        let dir = TempDir::new("records-listing-");
+        let token = token(&dir).await;
+        let directory = dir.path().join(RECORDS_DIR);
+        let records = InstanceRecords::open(dir.path()).await;
+        assert!(!records.has_shard_files().await, "no directory, no shard");
+        drop(records);
+
+        std::fs::create_dir_all(&directory).expect("create the directory");
+        test_file_write(&directory.join(NO_STORE_RECORDS), b"");
+        test_file_write(&directory.join("07.tmp"), b"cut short");
+        let records = InstanceRecords::open(dir.path()).await;
+        assert!(
+            !records.has_shard_files().await,
+            "a mark and a temporary file"
+        );
+        records.set(key(7, 1), 700).await;
+        write_back(&records, &token).await;
+        drop(records);
+        assert!(
+            InstanceRecords::open(dir.path())
+                .await
+                .has_shard_files()
+                .await
+        );
+    })
+    .await;
+}
+
+/// A process holds one set of records per directory, whatever path names it, until the last
+/// holder lets it go, so one write-back writes both holders' times.
+#[tokio::test]
+async fn holders_of_one_directory_share_one_set_of_records() {
+    in_context(async {
+        let dir = TempDir::new("records-shared-");
+        let token = token(&dir).await;
+        std::fs::create_dir(dir.path().join("sub")).expect("a directory to name the path through");
+        let first = InstanceRecords::open(dir.path()).await;
+        let second = InstanceRecords::open(&dir.path().join("sub").join("..")).await;
+        assert!(Arc::ptr_eq(&first, &second));
+        first.set(key(3, 1), 300).await;
+        second.set(key(3, 2), 302).await;
+        write_back(&first, &token).await;
+        drop((first, second));
+
+        let reopened = InstanceRecords::open(dir.path()).await;
+        assert_eq!(reopened.lookup(&key(3, 1)).await, Lookup::Recorded(300));
+        assert_eq!(reopened.lookup(&key(3, 2)).await, Lookup::Recorded(302));
+    })
+    .await;
+}
+
+/// Records tell whether a time was set, adopted or removed since they were opened. A lookup is
+/// no change, and records opened again, once let go, start with none.
+#[tokio::test]
+async fn records_tell_whether_they_changed_since_they_were_opened() {
+    in_context(async {
+        let dir = TempDir::new("records-changed-");
+        let token = token(&dir).await;
+        let records = InstanceRecords::open(dir.path()).await;
+        assert!(matches!(
+            records.lookup(&key(5, 1)).await,
+            Lookup::Missing(_)
+        ));
+        assert!(!records.has_changed());
+        records.set(key(5, 1), 500).await;
+        assert!(records.has_changed());
+        write_back(&records, &token).await;
+        assert!(records.has_changed(), "a write-back leaves the change told");
+        drop(records);
+
+        let records = InstanceRecords::open(dir.path()).await;
+        assert!(!records.has_changed());
+        records.remove(&key(5, 1)).await;
+        assert!(records.has_changed(), "a removal is a change");
     })
     .await;
 }
@@ -461,7 +544,7 @@ async fn a_failed_shard_write_is_reported_and_tried_again() {
         std::fs::create_dir_all(shard_path(dir.path(), 5).join("blocked"))
             .expect("block the shard");
 
-        assert!(records.write_back(&token, ()).await.is_err());
+        assert!(records.write_back(&token, false, ()).await.is_err());
         assert!(
             records.is_dirty(),
             "the failed shard is still to be written"
@@ -555,14 +638,14 @@ async fn a_shard_write_waits_for_the_last_one_to_land() {
             started,
             release: release_rx,
         };
-        let first = lore_spawn!(Arc::clone(&records).write_shard_file(7, held));
+        let first = lore_spawn!(Arc::clone(&records).write_shard_file(7, false, held));
         lore_spawn_blocking!(move || started_rx.recv())
             .await
             .expect("join the wait")
             .expect("the first write ends");
 
         records.set(key(7, 2), 200).await;
-        let mut second = std::pin::pin!(Arc::clone(&records).write_shard_file(7, ()));
+        let mut second = std::pin::pin!(Arc::clone(&records).write_shard_file(7, false, ()));
         assert!(second.as_mut().now_or_never().is_none());
         assert!(
             records.is_dirty(),

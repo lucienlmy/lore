@@ -662,6 +662,36 @@ def test_a_write_through_a_virtual_clone_survives_a_service_restart(
 
 
 @pytest.mark.smoke
+def test_a_committed_file_keeps_its_time_across_a_service_restart(
+    new_lore_repo, fuse_mounts, lore_service_runner
+):
+    """A file committed through a virtual clone, which the mount then serves from the store,
+    reports the time it showed before the commit once a replacement service remounts the
+    instance: the commit records the time in the instance's records, which the mount reports."""
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    repo.write_commit_push("initial", {"readme.txt": b"tracked\n"})
+    fuse = fuse_clone(repo, fuse_mounts)
+    local = os.path.join(fuse.path, "local.txt")
+    # Synced, so no cached write reaches the host file after its time is set; the time is well
+    # before the commit's clock, which a commit records.
+    with open(local, "wb") as written:
+        written.write(b"written through the mount\n")
+        os.fsync(written.fileno())
+    os.utime(local, (1_700_000_000, 1_700_000_000))
+    shown = os.stat(local).st_mtime_ns
+    fuse.stage(["local.txt"])
+    fuse.commit("commit the local file")
+
+    killed = lore_service_runner.service_processes[None]
+    killed.kill()
+    killed.wait()
+    repo.status()
+    assert os.stat(local).st_mtime_ns == shown, (
+        "the replacement reports the time the file showed"
+    )
+
+
+@pytest.mark.smoke
 def test_two_service_starts_succeed_while_the_winner_is_still_mounting(
     new_lore_repo,
     fuse_mounts,
@@ -1142,3 +1172,71 @@ def test_a_moved_fuse_instance_is_mounted_at_its_target_after_a_service_restart(
     assert os.path.exists(external), "keeping its external directory"
     assert cat(os.path.join(target, "readme.txt")) == b"tracked\n"
     assert cat(os.path.join(target, "local.txt")) == b"written before the move\n"
+
+
+@pytest.mark.smoke
+def test_instance_clone_mounts_a_copy_of_a_fuse_instance_with_its_changes(
+    new_lore_repo, scratch_dir, fuse_mounts, global_dir_name
+):
+    """The scratch directory is requested before `fuse_mounts`, so the new instance's mount is detached
+    before the directory holding it is removed."""
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    repo.write_commit_push(
+        "initial",
+        {
+            "kept.txt": b"kept\n",
+            "edited.txt": b"before\n",
+            "gone.txt": b"gone\n",
+            "staged.txt": b"staged before\n",
+        },
+    )
+    fuse = fuse_clone(repo, fuse_mounts)
+    # The virtual clone's first publish records no time, so a later sync gives one file a time of
+    # its own.
+    repo.write_commit_push("swapped in", {"swapped.txt": b"swapped\n"})
+    fuse.sync()
+    target = scratch_dir("fuse_clone_target_parent", create=True) / "cloned_fuse"
+    fuse_mounts.append(str(target))
+    fuse.write_files(
+        {
+            "edited.txt": b"after\n",
+            "added.txt": b"added\n",
+            "staged.txt": b"staged after\n",
+        }
+    )
+    fuse.remove_file("gone.txt")
+    fuse.stage(["staged.txt"])
+    changed = fuse.status()
+    kept_mtime = os.stat(os.path.join(fuse.path, "kept.txt")).st_mtime_ns
+    swapped_mtime = os.stat(os.path.join(fuse.path, "swapped.txt")).st_mtime_ns
+    assert swapped_mtime != kept_mtime, "the sync recorded a time of its own"
+    before = set(external_dirs(global_dir_name))
+
+    clone = fuse.repository_instance_clone(str(target), allow_copy=True)
+
+    assert is_mounted(str(target)), "the new instance is mounted at the target"
+    assert is_mounted(fuse.path), "and the source stays mounted"
+    assert len(set(external_dirs(global_dir_name)) - before) == 1, (
+        "the new instance has an external directory of its own"
+    )
+    assert clone.status() == changed, "every change is cloned, staged or not"
+    assert cat(os.path.join(target, "kept.txt")) == b"kept\n"
+    assert cat(os.path.join(target, "edited.txt")) == b"after\n"
+    assert cat(os.path.join(target, "added.txt")) == b"added\n"
+    assert not os.path.exists(os.path.join(target, "gone.txt"))
+    assert os.stat(os.path.join(target, "kept.txt")).st_mtime_ns == kept_mtime, (
+        "a tracked file keeps the time the source reports"
+    )
+    assert os.stat(os.path.join(target, "swapped.txt")).st_mtime_ns == swapped_mtime, (
+        "and one a sync swapped in keeps the time the sync recorded"
+    )
+    listed = fuse.repository_instance_list()
+    assert str(target) in listed and fuse.path in listed, "both are registered"
+
+    clone.write_files({"edited.txt": b"edited in the new instance\n"})
+    assert cat(os.path.join(fuse.path, "edited.txt")) == b"after\n", (
+        "a write in the new instance leaves the source alone"
+    )
+    clone.stage(["edited.txt"])
+    clone.commit("from the new instance")
+    assert cat(os.path.join(target, "edited.txt")) == b"edited in the new instance\n"

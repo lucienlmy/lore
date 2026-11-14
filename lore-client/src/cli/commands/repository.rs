@@ -429,13 +429,16 @@ pub enum RepositoryInstanceCommands {
     Move(RepositoryInstanceMoveArgs),
     /// Clone the current instance to a new path as an instance of its own, on the same revision,
     /// branch and staged state. The clone shares the instance's data blocks, and is refused where
-    /// the destination's filesystem or volume cannot share them unless --allow-copy is given.
-    /// The instance must use a shared store and not be a virtual clone, and the path must not be
-    /// inside another instance. While the clone runs, commands on the instance, and commands from
-    /// other processes on every instance over the store, wait for it where they open the store. An
+    /// the destination's filesystem or volume cannot share them unless --allow-copy is given. A
+    /// virtual clone on Linux is cloned into a virtual clone the service mounts at the path,
+    /// copying only its Lore directory and local changes, which the volume of the global data
+    /// directory holds. The instance must use a shared store, and the path must not be inside
+    /// another instance. While the clone runs, commands on the instance, and commands from other
+    /// processes on every instance over the store, wait for it where they open the store. An
     /// instance delete waits too, since it opens the store to deregister the instance before it
-    /// removes any file. An instance move renames the instance before it opens the store, so a move
-    /// makes the clone fail, or on Windows is refused while the clone lists one of its directories.
+    /// removes any file. An instance move renames an on-disk instance before it opens the store, so
+    /// a move makes the clone fail, or on Windows is refused while the clone lists one of its
+    /// directories.
     Clone(RepositoryInstanceCloneArgs),
 }
 

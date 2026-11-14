@@ -152,6 +152,34 @@ lore repository instance prune     # optional, from another instance of the same
   `lore-revision/src/repository.rs`). The registration goes at the next prune, and the path
   clones again.
 
+**Cloning a virtual clone.** `lore repository instance clone <path>`, run in a virtual clone,
+makes another virtual clone at `<path>` in the service, on the same revision, branch and staged
+state, over the same shared store:
+
+```sh
+cd ~/work/tree && lore repository instance clone ~/work/copy --allow-copy
+```
+
+- Cloning copies the source's external directory under the new instance's ID: the `.lore`, the
+  local files in `write/` and the deletion list. The tracked files come from the store, so cloning
+  costs what the local changes take. Where the volume holding the external directories clones
+  files (Btrfs, XFS or bcachefs), the copy shares their blocks; elsewhere, as on ext4, cloning is
+  refused with what a copy would take, unless `--allow-copy` is given (`answer`, `clone`,
+  `fs/fuse/clone.rs`).
+- Each instance writes its own copy from then on: a write in either leaves the other alone.
+- The new instance reports the times the source's swaps and commits recorded, which travel in its
+  modified-time records, `.lore/records/` (see "Attributes and times").
+- The new instance's external directory is locked and marked as being cloned, the mark naming the
+  destination, before anything is copied. Its mount point is made at the destination before it is
+  registered there, so cloning to a destination another has taken is refused before it registers;
+  then it is mounted at the revision its anchors name (`place_virtual_clone`, `instance.rs`;
+  `mount_clone`, `mount_manager.rs`). A failure removes the mount point, the registration and the
+  external directory. A service stopped part way, as by a crash, removes at its next start a new
+  instance it had not registered, with the empty mount point its mark names, and mounts one it had
+  registered (`remove_interrupted_clones`, `mount_manager.rs`).
+- Writes through the source's mount while it is cloned are copied or not, as a file written in an
+  ordinary instance while it is cloned is; the new instance mounts whatever was copied.
+
 **Stale mounts.** A service that dies leaves a mount answering `ENOTCONN`. On start the service
 detects this with `statfs` and detaches it lazily before remounting (`remount_instance`,
 `mount_manager.rs`; `is_stale_mount`, `src/mount.rs`). By hand: `fusermount3 -uz <path>`. Only one
@@ -292,7 +320,8 @@ first, lose the socket and leave dead endpoints.
 |---|---|---|
 | Clone | Mounts an empty `State`, then the clone's swap publishes the revision. Records `vfs.base_time` in the instance config. The hold fetches nothing beyond the revision's state and tree headers, and starts a background prefetch that warms the store (see "Prefetch"); the provider loads the rest on demand (`clone_materialize_hold`, `repository/clone.rs`). While the state's records cache, the clone reads the root's ignore file into the store, so a command run offline finds it, and returns once both are done (`clone_onto_held_state`, `repository/clone.rs`). | `create_mount`, `mount_manager.rs`; `create_local`, `lore-revision/src/repository.rs` |
 | Failed clone | Detached lazily, its external directory removed, and the mount point removed where the clone created it and it is empty; the registration goes at the next prune. | `abandon_clone`, `mount_manager.rs`; `clone`, `abandon_failed_fuse_clone`, `repository/clone.rs` |
-| Service start | Mounts each registered FUSE instance at its current revision. A store it cannot open or list, and an instance whose `.lore` or config it cannot read, is logged and skipped, and the rest are mounted. An instance whose mount point was deleted has its external directory removed and is not mounted; a path that cannot be reached is left alone, and the next prune of the store retires the registration. | `mounts_of_entries`, `fs/mount_manager.rs`; `remove_deleted_instance`, `remount_instances`, `mount_manager.rs` |
+| Instance clone | `lore repository instance clone`: locks and marks the new instance's external directory, the mark naming the destination; copies the source's external directory under the new instance's ID, holding the source's repository lock alone; gives the new instance the source's anchors; makes the mount point at the destination; registers the new instance there and mounts it at the revision its anchors name. A failure removes the mount point, the registration and the external directory. | `place_virtual_clone`, `instance.rs`; `mount_clone`, `mount_manager.rs`; `fs/fuse/clone.rs` |
+| Service start | Mounts each registered virtual clone at its current revision. A store it cannot open or list, and an instance whose `.lore` or config it cannot read, is logged and skipped, and the rest are mounted. An instance whose mount point was deleted has its external directory removed and is not mounted; a path that cannot be reached is left alone, and the next prune of the store retires the registration. An external directory that cloning left marked as in progress, whose lock no other cloning holds, is removed with the empty mount point its mark names where no store registers its instance, and loses only the mark where one does; one a removal renamed aside, and a lock file no cloning holds, is removed. | `mounts_of_entries`, `fs/mount_manager.rs`; `remove_deleted_instance`, `remove_interrupted_clones`, `remount_instances`, `mount_manager.rs` |
 | Stale endpoint | Detected by `statfs` → `ENOTCONN`, lazily unmounted before remount. | `remount_instance`, `mount_manager.rs` |
 | Delete | `lore repository instance delete`: unmounts the clone, which a busy mount refuses with `MountsBusy`, then removes its registration, its external directory and the empty mount point. | `instance_delete`, `lore-revision/src/instance.rs` |
 | Move | `lore repository instance move`: refused while the service stops; unmounts the clone, which a busy mount refuses with `MountsBusy`; mounts it on a mount point made at the target at the revision it served; registers it there; removes the old mount point. When mounting or registering at the target fails, it mounts the clone at its source again. A crash after the mount at the target and before the registration leaves a stale endpoint there, which `fusermount3 -uz <target>` detaches; the next start mounts the clone at its source. | `move_mount`, `mount_manager.rs`; `instance_move_with`, `instance.rs` |
@@ -904,10 +933,24 @@ State is rebuilt at every mount.
 - Files are `0444`, or `0555` if executable; directories `0555` with `st_nlink = 1`. A writable
   provider adds the owner write bit. Owner is the mounting user; `st_blksize` is `MAX_READ`
   (1 MiB) (`attr_for`, `fs/fuse/attr.rs`). Local entries report their host file (see Writes).
-- Every path reports the instance's base time until a swap records one.
-- Swap times are stored under their own mutable-store keys (`fuse-recorded-time`, with a
-  `fuse-recorded-times` marker), apart from the file modification keys scans and commits write.
-  Until the marker exists no inode creation reads the store (`RecordedTimes`, `attr.rs`).
+- A file served from the store reports the time the instance's modified-time records hold for its
+  path, `.lore/records/`, else the instance's base time (`RecordedTimes`, `attr.rs`). The mount and
+  the commands the service runs on the instance share one set of records (`InstanceRecords::open`,
+  `lore-revision/src/records.rs`). A swap records its time for each path it changes and writes the
+  records back before it publishes, synced under `--sync-data`. A commit records the modification
+  time it read for each file it stores, however recent, so a committed file keeps the time it
+  showed; the times are written back with the commit's flush, after the commit serves the files from
+  the store. Until the records hold a shard file or a time is set, no inode creation looks a time
+  up. An instance clone carries the records.
+- A virtual clone tells a changed file by address and content, never by a recorded time: its
+  scan is the diff of the filesystem State (see "Status and diff"), a single file is compared
+  through `file_holds_content`, and no comparison records a time (`file_modification` and
+  `file_modified_against_node`, `lore-revision/src/state.rs`).
+- v0.14.0 also stored swap times in the mutable store (`fuse-recorded-time`, with a
+  `fuse-recorded-times` marker). Its swaps recorded the same times in the records, which this client
+  reads alone. After a downgrade, v0.14.0 reports older times for the files this client's swaps
+  changed: run a clean build in each virtual clone after a downgrade. A mount over a context without
+  a Lore directory, as a test's, keeps its times under those mutable-store keys.
 - Times are stored before a swap applies anything (`swap_through`, `swap.rs`).
 
 ### The READ path
@@ -1177,7 +1220,7 @@ in the code.
 | `UNMOUNT_BUSY_RETRIES`, `UNMOUNT_BUSY_BACKOFF` | constants (`src/mount.rs`) | 5, 20 ms | Busy-unmount retries. |
 | `DRAIN_WAIT` | constant (`fs/fuse/mount.rs`) | 2 s | Debug-build FORGET drain on plain unmount. |
 | `DRAIN_RESEND`, `DRAIN_SETTLE` | constants (`fs/fuse/mount.rs`) | 50 ms, 100 ms | The drain's interval between invalidations, and how long the table must count no lookups before it ends. |
-| `vfs.base_time` | instance config (`VfsConfig::base_time`, `lore-revision/src/repository.rs`) | clone time | Time every path reports until a swap records one. |
+| `vfs.base_time` | instance config (`VfsConfig::base_time`, `lore-revision/src/repository.rs`) | clone time | Time a file served from the store reports until a time is recorded for its path. |
 | `LORE_IMMUTABLE_STORE_VERIFY_WRITE` | env (`LocalImmutableStore::new_claimed`, `lore-storage/src/local/immutable_store.rs`) | off | `1` or `true` verifies each local store write by read-back and rehash. |
 | `LORE_MAX_CONNECTIONS` | env of the service process, or `--max-connections` (`lore_globals_from_args`, `lore-client/src/cli/cli.rs`) | 1, at most 10 (`storage_connection_count`, `connect_impl`, `lore-transport/src/connection.rs`) | Storage connections the process opens; remote fetches spread over them. The first connection a process makes to a remote fixes the count for its lifetime. Throughput from a distant remote scales with the count ("Remote fetch throughput"). |
 | `LORE_FUSE_RECORD_DIR` | env, read at mount time (`RECORD_DIR_ENV`, `access_recorder.rs`; `mount_with`, `fs/fuse/mount.rs`) | unset | Each mount records first-access paths to `<dir>/<instance id>-<unix seconds>.txt`. See "Access recording" above. |

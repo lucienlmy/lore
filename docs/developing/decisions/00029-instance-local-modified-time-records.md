@@ -1,6 +1,6 @@
 ---
-status: accepted
-date: 2026-11-13
+status: superseded by [ADR-00037](00037-fuse-mount-reports-modified-time-records.md)
+date: 2026-11-14
 deciders: Zack Neyland
 ---
 

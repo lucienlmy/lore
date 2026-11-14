@@ -10182,7 +10182,9 @@ impl FileModification {
 /// Size and the recorded modification time answer first where they can, and comparing the
 /// content answers the rest. A recorded time speaks for the node the current revision holds
 /// and no other, so a caller asking about a different node sets `force_check_hash`, or else
-/// knows that no time can have been recorded for the path.
+/// knows that no time can have been recorded for the path. A provider that holds its state
+/// ([`InstanceOperationImpl::holds_state`]) is compared by content alone, which it answers from
+/// addresses where it can: its recorded times are the times its mount reports.
 ///
 /// Records nothing. Whether an observed match is worth recording depends on which node was
 /// asked about, which only the caller knows.
@@ -10204,14 +10206,13 @@ pub async fn file_modification(
         return Ok(FileModification::ModifiedBySize);
     }
 
-    let node_mtime = if !force_check_hash {
+    let by_time = !force_check_hash && !operation.holds_state();
+    let node_mtime = if by_time {
         file_modified_time(repository.clone(), file_path).await
     } else {
         0
     };
-    // A forced comparison has no recorded time to answer from, and its stand-in must not match: an
-    // SWFS file the instance holds unmodified, with no time recorded, reads as 0 too.
-    if !force_check_hash && file_mtime == node_mtime {
+    if by_time && file_mtime == node_mtime {
         lore_trace!("File {file_path} unmodified, size {file_size} and mtime {file_mtime} match");
         return Ok(FileModification::UnmodifiedByMtime);
     }
@@ -10246,7 +10247,8 @@ pub async fn file_modification(
 /// answer for any other node nor be written from a match against one. Recording here is what
 /// spares the next scan the hash check this one just paid for. A time not older than the
 /// filesystem clock the operation read before reading the file is not recorded: a write after
-/// the read may share it ([`InstanceOperationImpl::clock_floor`]).
+/// the read may share it ([`InstanceOperationImpl::clock_floor`]). Nothing is recorded through a
+/// provider that holds its state, whose comparisons read no recorded time.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -10275,6 +10277,7 @@ pub fn file_modified_against_node<'a>(
 
         if node_is_current
             && matches!(modification, FileModification::UnmodifiedByHash)
+            && !operation.holds_state()
             && file_mtime < operation.clock_floor(&repository).await
         {
             file_modified_time_store(repository, file_path, file_mtime).await;
@@ -10349,7 +10352,8 @@ impl RecordedModifiedTimes {
     /// none of them can be shared by a write that follows — bounded, so a filesystem that does not
     /// appear to move on is left with times a following write can still share rather than being
     /// waited on forever. See [`wait_until_settled`]. A collector with a floor holds only times
-    /// older than a stamp the filesystem has already given, so it has nothing to wait for.
+    /// older than a stamp the filesystem has already given, so it has nothing to wait for, and
+    /// nothing waits for a provider that holds its state, which compares no file by time.
     pub async fn store(&self, repository: Arc<RepositoryContext>) {
         let store = match repository.try_mutable_store_arc() {
             Some(store) if !execution_context().globals().dry_run() => store,
@@ -10417,7 +10421,7 @@ impl RecordedModifiedTimes {
             }
         }
 
-        if self.floor == u64::MAX && mtime_max != 0 {
+        if self.floor == u64::MAX && mtime_max != 0 && !repository.file_system().holds_state() {
             wait_until_settled(&repository, mtime_max).await;
         }
     }
@@ -10676,6 +10680,7 @@ async fn store_modified_time(repository: &RepositoryContext, path: &impl WalkPat
 }
 
 /// The modification time stored under `key` in `repository`'s mutable store, 0 for none.
+#[lore_macro::test_pub]
 pub(crate) async fn stored_modified_time(repository: &RepositoryContext, key: Hash) -> u64 {
     match repository
         .read_mutable_store()

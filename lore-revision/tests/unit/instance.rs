@@ -908,7 +908,13 @@ fn refusal(
     answer: &lore_revision::fs::filesystem_provider::CloneAnswer,
     allow_copy: bool,
 ) -> Result<(), InstanceError> {
-    refuse_clone(answer, allow_copy, "/source", "/destination")
+    refuse_clone(
+        answer,
+        allow_copy,
+        "/source",
+        lore_revision::repository::VfsType::None,
+        "/destination",
+    )
 }
 
 #[test]
@@ -959,4 +965,26 @@ fn only_a_clone_s_name_is_taken_for_one_in_progress() {
     assert!(!named(&format!("proj.cloning-{v7}.lock")));
     assert!(!named(&format!("other.cloning-{v7}")));
     assert!(!named(&format!("proj.cloning-{v7}x")));
+}
+
+/// A destination whose name leaves no room for the names cloning writes beside it is refused when
+/// cloning an on-disk instance, and taken when cloning a virtual clone, which writes nothing beside
+/// its destination.
+#[tokio::test]
+async fn a_long_destination_name_is_refused_only_where_the_clone_writes_beside_it() {
+    let global = TempDir::new("lore-instance-long-name-global-");
+    let parent = TempDir::new("lore-instance-long-name-");
+    let target = parent.path().join("n".repeat(240));
+    let target = target.to_str().expect("a UTF-8 path");
+    LORE_CONTEXT
+        .scope(execution_in(global.path()), async {
+            assert!(matches!(
+                resolve_clone_destination(target, true),
+                Err(InstanceError::InvalidArguments(_))
+            ));
+            let resolved = resolve_clone_destination(target, false)
+                .expect("taken when cloning a virtual clone");
+            assert_eq!(resolved.file_name(), Path::new(target).file_name());
+        })
+        .await;
 }

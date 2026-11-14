@@ -2465,9 +2465,14 @@ fn display_path(path: &Path) -> String {
 /// Where a clone at `target_path` can be created: its resolved parent joined with its name.
 ///
 /// Refused with [`InstanceError::InvalidArguments`]: a destination that exists, one whose parent
-/// does not, one that names no directory, and one nested in another instance or in a virtual
-/// instance's mount.
-fn resolve_clone_destination(target_path: &str) -> Result<PathBuf, InstanceError> {
+/// does not, one that names no directory, one nested in another instance or in a virtual
+/// instance's mount, and, where cloning `writes_beside` it, one whose name leaves no room for the
+/// names cloning gives the paths beside it.
+#[lore_macro::test_pub]
+fn resolve_clone_destination(
+    target_path: &str,
+    writes_beside: bool,
+) -> Result<PathBuf, InstanceError> {
     if target_path.is_empty() {
         return Err(refused_target("no target path given".to_string()));
     }
@@ -2483,7 +2488,7 @@ fn resolve_clone_destination(target_path: &str) -> Result<PathBuf, InstanceError
     // The longest name the clone gives a path beside the destination: a removal's, which ends
     // in [`REMOVING_SUFFIX`] after the in-progress name and its 32 hexadecimal digits.
     let longest = name.len() + IN_PROGRESS_INFIX.len() + 32 + REMOVING_SUFFIX.len();
-    if longest > MAX_NAME_LENGTH {
+    if writes_beside && longest > MAX_NAME_LENGTH {
         return Err(refused(&format!(
             "its name is too long for the directory the clone writes beside it, whose name \
              adds {} characters",
@@ -2575,10 +2580,10 @@ fn in_progress_path(destination: &Path, clone_id: InstanceId) -> PathBuf {
 
 /// What a removal of an in-progress directory appends to its name as it renames it aside, so a
 /// removal cut short leaves a directory the next clone removes whatever is left in it.
-const REMOVING_SUFFIX: &str = ".removing";
+pub(crate) const REMOVING_SUFFIX: &str = ".removing";
 
 /// The name an in-progress directory is renamed to while it is removed.
-fn removing_path(in_progress: &Path) -> PathBuf {
+pub(crate) fn removing_path(in_progress: &Path) -> PathBuf {
     sibling_with_suffix(in_progress, REMOVING_SUFFIX)
 }
 
@@ -2611,18 +2616,25 @@ pub struct InstanceClonePlan {
     target_path: String,
     /// The instance ID the copy takes.
     clone_id: InstanceId,
-    /// Where the clone is written before it takes the destination, beside it.
+    /// The VFS serving the source, [`VfsType::None`] for one in a directory of its own.
+    vfs: VfsType,
+    /// Where the copy is written: beside the destination before it takes it, or for a virtual
+    /// clone, the new instance's external directory, which its mount serves the destination from.
     in_progress: PathBuf,
     /// Held from the plan to the finish, so another clone to the destination never takes this
     /// clone's in-progress directory for one an interrupted clone left.
     in_progress_lock: Arc<InProgressLock>,
     answer: CloneAnswer,
     allow_copy: bool,
+    /// Set once the new instance is at its destination, so the finish removes nothing cloning
+    /// wrote.
+    placed: AtomicBool,
 }
 
 #[cfg(feature = "test-util")]
 impl InstanceClonePlan {
-    /// Where the clone is written before it takes the destination.
+    /// Where the copy is written: beside the destination, or for a virtual clone, the new
+    /// instance's external directory.
     pub fn in_progress(&self) -> &Path {
         &self.in_progress
     }
@@ -2633,19 +2645,35 @@ impl InstanceClonePlan {
     }
 }
 
-/// Refuses a clone from `source` to `target` whose `answer` does not share blocks, unless
-/// `allow_copy` opts into the copy it describes, with [`InstanceError::NotSupported`], and a copy
-/// the destination has no room for with [`InstanceError::Oversized`]. An unsupported clone is
-/// always refused.
+/// Refuses cloning `source`, served by `vfs`, to `target` where `answer` does not share blocks,
+/// unless `allow_copy` opts into the copy it describes, with [`InstanceError::NotSupported`], and a
+/// copy the volume it writes to has no room for with [`InstanceError::Oversized`]. An unsupported
+/// answer is always refused. A virtual clone's copy is written beside the external directories, so
+/// its remedy names their volume, not the destination's.
 #[lore_macro::test_pub]
 fn refuse_clone(
     answer: &CloneAnswer,
     allow_copy: bool,
     source: &str,
+    vfs: VfsType,
     target: &str,
 ) -> Result<(), InstanceError> {
     use lore_base::units::format_bytes_to_string;
 
+    let (remedy, written_to) = if vfs == VfsType::Fuse {
+        (
+            "Put Lore's global data directory, which holds the local changes of every virtual \
+             clone, on a filesystem that clones files (Btrfs, XFS or bcachefs)",
+            "the global data directory's volume",
+        )
+    } else {
+        (
+            "Put the instances on a filesystem that clones files (Dev Drive or ReFS on Windows, \
+             APFS on macOS, Btrfs, XFS or bcachefs on Linux), with the destination on the \
+             source's volume",
+            "the destination's volume",
+        )
+    };
     match answer {
         CloneAnswer::Unsupported { reason } => Err(NotSupported {
             operation: format!("cloning {source} to {target}: {reason}"),
@@ -2653,10 +2681,8 @@ fn refuse_clone(
         .into()),
         CloneAnswer::CopiesBytes { reason, size, .. } if !allow_copy => Err(NotSupported {
             operation: format!(
-                "cloning {source} to {target} by sharing data blocks: {reason}. Put the \
-                 instances on a filesystem that clones files (Dev Drive or ReFS on Windows, APFS \
-                 on macOS, Btrfs, XFS or bcachefs on Linux), with the destination on the source's volume, \
-                 or allow a copy, which takes {} for {} files and holds the store's locks \
+                "cloning {source} to {target} by sharing data blocks: {reason}. {remedy}, or \
+                 allow a copy, which takes {} for {} files and holds the store's locks \
                  throughout",
                 format_bytes_to_string(size.size),
                 size.file_count
@@ -2667,7 +2693,7 @@ fn refuse_clone(
             size, available, ..
         } if *available < size.size => Err(Oversized {
             context: format!(
-                "copying {source} to {target} takes {}, and the destination's volume has {} free",
+                "copying {source} to {target} takes {}, and {written_to} has {} free",
                 format_bytes_to_string(size.size),
                 format_bytes_to_string(*available)
             ),
@@ -2689,12 +2715,12 @@ fn send_clone_progress(phase: LoreRepositoryInstanceClonePhase, path: &str, stat
 }
 
 /// Whether anything is at `path`.
-async fn is_present(path: &Path) -> bool {
+pub(crate) async fn is_present(path: &Path) -> bool {
     lore_io::IoDriver::global().symlink_stat(path).await.is_ok()
 }
 
 /// Releases the lock of the clone in progress at `in_progress` and removes its lock file.
-async fn release_in_progress_lock(in_progress: &Path, lock: FSLock) {
+pub(crate) async fn release_in_progress_lock(in_progress: &Path, lock: FSLock) {
     let named = in_progress.to_path_buf();
     let lock_file = lore_base::lore_spawn_blocking!(move || FSLock::lock_file_of(&named)).await;
     drop(lock);
@@ -2820,7 +2846,8 @@ async fn remove_clone_directory(path: &Path, aside: Option<&Path>, left_by: &str
 ///
 /// In a dry run (the global `dry_run` flag), stops there and returns `None`. Otherwise removes
 /// the in-progress directories interrupted clones to the destination left, and returns the plan,
-/// holding the lock of its own in-progress directory.
+/// holding the lock of its own in-progress directory: for a virtual clone, its external
+/// directory, which a service that starts removes where an interrupted clone left it.
 pub async fn instance_clone_plan(
     repository: Arc<RepositoryContext>,
     target_path: &str,
@@ -2847,6 +2874,11 @@ async fn instance_clone_plan_with(
     let instance_id = repository.instance_id;
     let source = repository.require_path()?.to_path_buf();
     let dot_path = repository.dot_dir_path()?.to_path_buf();
+    let vfs = require_own_mount(
+        instance_id,
+        &repository.path_for_display().to_string(),
+        "clone",
+    )?;
     if !uses_shared_store(&repository).await? {
         return Err(NotSupported {
             operation: "cloning an instance with a local store, since the clone's anchors and \
@@ -2858,9 +2890,11 @@ async fn instance_clone_plan_with(
     }
     // Resolving the destination stats each directory above it, so it runs off the runtime.
     let target = target_path.to_string();
-    let destination = lore_base::lore_spawn_blocking!(move || resolve_clone_destination(&target))
-        .await
-        .internal("resolving the clone's destination")??;
+    let writes_beside = vfs != VfsType::Fuse;
+    let destination =
+        lore_base::lore_spawn_blocking!(move || resolve_clone_destination(&target, writes_beside))
+            .await
+            .internal("resolving the clone's destination")??;
     let target_path = display_path(&destination);
     let source_path = display_path(&source);
     let answer = provider
@@ -2913,7 +2947,7 @@ async fn instance_clone_plan_with(
         reason: LoreString::from_str(reason),
     })
     .send();
-    refuse_clone(&answer, allow_copy, &source_path, &target_path)?;
+    refuse_clone(&answer, allow_copy, &source_path, vfs, &target_path)?;
 
     if dry_run {
         LoreEvent::RepositoryInstanceCloneComplete(LoreRepositoryInstanceCloneCompleteEventData {
@@ -2928,7 +2962,12 @@ async fn instance_clone_plan_with(
     }
 
     let clone_id = InstanceId::generate();
-    let in_progress = in_progress_path(&destination, clone_id);
+    let in_progress = if vfs == VfsType::Fuse {
+        external_dir_for_instance(clone_id)
+            .forward_any::<InstanceError>("finding the new instance's external directory")?
+    } else {
+        in_progress_path(&destination, clone_id)
+    };
     // The lock file's name holds the new instance ID, so no other clone holds it; the lock is
     // taken off the runtime, as resolving its path stats the directory it lies in.
     let locking = in_progress.clone();
@@ -2952,36 +2991,40 @@ async fn instance_clone_plan_with(
         destination,
         target_path,
         clone_id,
+        vfs,
         in_progress_lock: Arc::new(InProgressLock {
             _lock: in_progress_lock,
             in_progress: in_progress.clone(),
+            remove_file: false,
         }),
         in_progress,
         answer,
         allow_copy,
+        placed: AtomicBool::new(false),
     }))
 }
 
 /// Clones the current instance as `plan` describes: copies its directory, `.lore` included,
 /// through the provider's clone backend, and registers the copy as an instance of its own at the
-/// source's current revision, branch and staged state.
+/// source's current revision, branch and staged state. A virtual clone's copy is its external
+/// directory, which its mount serves the destination from, as [`place_virtual_clone`] describes.
 ///
 /// The anchors are read, and a destination another live instance is registered at is refused,
-/// before the clone writes anything. The copy is written to the plan's in-progress directory,
-/// whose Lore directory is marked as a clone in progress, names the copy's new ID and is marked
-/// as holding no store records before anything else is copied. The modified-time records are
-/// written back first, so the copy's first scan hashes only the files a scan of the source would:
-/// those with no record, and those changed since theirs. A source moved or deleted during the copy
-/// fails the clone: `instance move` and `instance delete` take no repository lock, so the lock does
-/// not keep them out, though on Windows the copy's hold on the directory it lists refuses them. The anchors are written to the shared store, and synced to disk,
-/// before the copy takes the destination, and the registration, which retires other
+/// before the clone writes anything. The copy is written to the plan's in-progress directory, whose
+/// Lore directory is marked as a clone in progress, names the copy's new ID and is marked as
+/// holding no store records before anything else is copied. The modified-time records are written
+/// back first, so the first scan of a copy of an on-disk instance hashes only the files a scan of
+/// the source would: those with no record, and those changed since theirs. A source moved or
+/// deleted during the copy fails the clone: `instance move` and `instance delete` take no
+/// repository lock, so the lock does not keep them out, though on Windows the copy's hold on the
+/// directory it lists refuses them. The anchors are written to the shared store, and synced to
+/// disk, before the copy takes the destination, and the registration, which retires other
 /// registrations at the destination, only once it has. A failure before the move removes the
 /// clone's keys as far as the store allows; a crash before it leaves the clone's three anchor keys
-/// and no registration, and a crash after it an instance that registers itself when a write
-/// command next opens it. The copied files' data is not synced: after a power loss a copied file
-/// can hold less than its kept time vouches for, as after any copy the system has not written
-/// out. A failure names the in-progress directory and leaves it for [`instance_clone_finish`] to
-/// remove.
+/// and no registration, and a crash after it an instance that registers itself when a write command
+/// next opens it. The copied files' data is not synced: after a power loss a copied file can hold
+/// less than its kept time vouches for, as after any copy the system has not written out. A failure
+/// names the in-progress directory and leaves it for [`instance_clone_finish`] to remove.
 ///
 /// The caller holds the instance's repository lock alone, and with it the store's locks, for
 /// the whole call (see [`crate::repository::load_and_connect_exclusive`]), so no other command
@@ -3003,13 +3046,7 @@ async fn instance_clone_with(
     register: impl AsyncFn(&Arc<RepositoryContext>, InstanceId, &str) -> Result<(), InstanceError>,
 ) -> Result<(), InstanceError> {
     let instance_id = repository.instance_id;
-    let context = || {
-        format!(
-            "cloning to {}, in progress at {}",
-            plan.target_path,
-            display_path(&plan.in_progress)
-        )
-    };
+    let context = || clone_context(plan);
     // An instance moved to the source's path since the plan is not the tree the plan measured.
     if instance_id != plan.source_id {
         return Err(FileNotFound {
@@ -3052,9 +3089,54 @@ async fn instance_clone_with(
         .forward_with::<InstanceError, _>(context)?;
 
     send_clone_progress(LoreRepositoryInstanceClonePhase::Registering, "", stats);
+    if plan.vfs == VfsType::Fuse {
+        place_virtual_clone(&repository, plan, anchors, register)
+            .await
+            .forward_with::<InstanceError, _>(context)?;
+    } else {
+        place_clone(&repository, plan, anchors, move_into_place, register).await?;
+    }
+
+    LoreEvent::RepositoryInstanceCloneComplete(LoreRepositoryInstanceCloneCompleteEventData {
+        instance_id: plan.clone_id,
+        target_path: LoreString::from_str(&plan.target_path),
+        cloned_directory_count: stats.cloned_directory_count,
+        cloned_entry_count: stats.cloned_entry_count,
+        copied_file_count: stats.copied_file_count,
+    })
+    .send();
+    lore_debug!(
+        "Cloned instance {instance_id} at {} to {} as {}",
+        plan.source.display(),
+        plan.target_path,
+        plan.clone_id
+    );
+    Ok(())
+}
+
+/// What cloning as `plan` describes says it was doing, where it fails.
+fn clone_context(plan: &InstanceClonePlan) -> String {
+    format!(
+        "cloning to {}, in progress at {}",
+        plan.target_path,
+        display_path(&plan.in_progress)
+    )
+}
+
+/// Places the copy `plan` made in its own directory: gives it the source's `anchors`, moves it to
+/// the destination through `move_into_place`, removes the mark of an instance being cloned and
+/// registers it through `register`, as [`instance_clone`] describes.
+async fn place_clone(
+    repository: &Arc<RepositoryContext>,
+    plan: &InstanceClonePlan,
+    anchors: [Hash; 3],
+    move_into_place: impl AsyncFn(&Path, &Path) -> io::Result<()>,
+    register: impl AsyncFn(&Arc<RepositoryContext>, InstanceId, &str) -> Result<(), InstanceError>,
+) -> Result<(), InstanceError> {
+    let context = || clone_context(plan);
     let flush_options = crate::lore::execution_context().globals().flush_options();
     let placed = async {
-        store_anchors(&repository, plan.clone_id, anchors).await?;
+        store_anchors(repository, plan.clone_id, anchors).await?;
         // Synced whatever `--sync-data` says, so the rename never lands on disk before them.
         repository
             .flush(FlushOptions::SYNC_DATA)
@@ -3079,21 +3161,15 @@ async fn instance_clone_with(
     }
     .await;
     if let Err(err) = placed {
-        remove_instance_keys(&repository, plan.clone_id).await;
+        remove_instance_keys(repository, plan.clone_id).await;
         if let Err(flush_err) = repository.flush(flush_options).await {
             lore_warn!("Failed to flush the removal of a failed clone's registration: {flush_err}");
         }
         return Err(err).forward_with::<InstanceError, _>(context);
     }
-    if let Ok(dot_name) = lore_directory_within(&plan.source, &plan.dot_path)
-        && let Err(err) = lore_io::IoDriver::global()
-            .remove_file(plan.destination.join(dot_name).join(CLONE_IN_PROGRESS_MARK))
-            .await
-    {
-        lore_warn!(
-            "Failed to remove the mark of a clone in progress from {}: {err}",
-            plan.target_path
-        );
+    plan.placed.store(true, Ordering::Release);
+    if let Ok(dot) = clone_lore_directory(plan, &plan.destination) {
+        remove_clone_mark(&dot, &plan.target_path).await;
     }
     // A registration synced to disk never names a destination the move has not reached there.
     if flush_options.sync_data {
@@ -3110,7 +3186,7 @@ async fn instance_clone_with(
             ),
         }
     }
-    register(&repository, plan.clone_id, &plan.target_path)
+    register(repository, plan.clone_id, &plan.target_path)
         .await
         .forward_with::<InstanceError, _>(|| {
             format!(
@@ -3118,23 +3194,162 @@ async fn instance_clone_with(
                  opens it",
                 plan.target_path
             )
-        })?;
+        })
+}
 
-    LoreEvent::RepositoryInstanceCloneComplete(LoreRepositoryInstanceCloneCompleteEventData {
-        instance_id: plan.clone_id,
-        target_path: LoreString::from_str(&plan.target_path),
-        cloned_directory_count: stats.cloned_directory_count,
-        cloned_entry_count: stats.cloned_entry_count,
-        copied_file_count: stats.copied_file_count,
-    })
-    .send();
-    lore_debug!(
-        "Cloned instance {instance_id} at {} to {} as {}",
-        plan.source.display(),
-        plan.target_path,
-        plan.clone_id
-    );
+/// Places the virtual clone whose external directory `plan` wrote: gives it the source's
+/// `anchors`, makes its mount point at the destination, registers it there through `register`,
+/// mounts it at the revision the anchors name, and removes the mark of an instance being cloned.
+///
+/// The mount point is made before the registration, which retires other registrations at the
+/// destination, so cloning to a destination another cloning has taken since the plan is refused
+/// before it registers. A service that stops part way, as a crash stops it, finds on its next
+/// start either a new instance it has not registered, whose external directory it removes with the
+/// empty mount point its mark names, or a registered one with its mount point, which it mounts. A
+/// failure removes the mount point and the new instance's keys, as far as the store allows, and
+/// leaves the external directory for [`instance_clone_finish`] to remove.
+async fn place_virtual_clone(
+    repository: &Arc<RepositoryContext>,
+    plan: &InstanceClonePlan,
+    anchors: [Hash; 3],
+    register: impl AsyncFn(&Arc<RepositoryContext>, InstanceId, &str) -> Result<(), InstanceError>,
+) -> Result<(), InstanceError> {
+    let anchored = async {
+        store_anchors(repository, plan.clone_id, anchors).await?;
+        // Synced whatever `--sync-data` says, so a registration never lands on disk before them.
+        repository
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .forward_any::<InstanceError>("flushing the clone's anchors")
+    }
+    .await;
+    let placed = match anchored {
+        Ok(()) => place_mount(repository, plan, register).await,
+        Err(err) => Err(err),
+    };
+    if let Err(err) = placed {
+        remove_instance_keys(repository, plan.clone_id).await;
+        let flush_options = crate::lore::execution_context().globals().flush_options();
+        if let Err(flush_err) = repository.flush(flush_options).await {
+            lore_warn!("Failed to flush the removal of a failed clone's registration: {flush_err}");
+        }
+        return Err(err);
+    }
+    plan.placed.store(true, Ordering::Release);
+    remove_clone_mark(
+        &plan.in_progress.join(crate::repository::DOT_LORE),
+        &plan.target_path,
+    )
+    .await;
     Ok(())
+}
+
+/// Makes the mount point of the virtual clone `plan` wrote at its destination, which must not
+/// exist, then registers the new instance there through `register` and mounts it, removing the
+/// mount point again where either fails.
+async fn place_mount(
+    repository: &Arc<RepositoryContext>,
+    plan: &InstanceClonePlan,
+    register: impl AsyncFn(&Arc<RepositoryContext>, InstanceId, &str) -> Result<(), InstanceError>,
+) -> Result<(), InstanceError> {
+    let mount_point = plan.destination.clone();
+    let made = lore_base::lore_spawn_blocking!(move || std::fs::create_dir(&mount_point))
+        .await
+        .internal("making the new instance's mount point")?;
+    match made {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(refused_target(format!(
+                "{}: it already exists",
+                plan.target_path
+            )));
+        }
+        Err(err) => {
+            return Err(clone_io_failure(
+                err,
+                "making the new instance's mount point",
+            ))
+            .forward::<InstanceError>("making the new instance's mount point");
+        }
+    }
+    let mounted = match register(repository, plan.clone_id, &plan.target_path).await {
+        Ok(()) => mount_fuse_clone(repository, plan).await,
+        Err(err) => Err(err).forward::<InstanceError>("registering the clone"),
+    };
+    if mounted.is_err()
+        && let Err(err) = lore_io::IoDriver::global()
+            .remove_dir(&plan.destination)
+            .await
+    {
+        lore_warn!(
+            "Unable to remove {}, the mount point of an instance whose cloning failed: {err}",
+            plan.target_path
+        );
+    }
+    mounted
+}
+
+/// Mounts the virtual clone `plan` wrote on the mount point made at its destination.
+#[cfg(target_os = "linux")]
+async fn mount_fuse_clone(
+    repository: &RepositoryContext,
+    plan: &InstanceClonePlan,
+) -> Result<(), InstanceError> {
+    let Some(mm) = MountManagerState::mount_manager() else {
+        return Err(InstanceError::internal(format!(
+            "{}: a virtual clone is cloned only in the service, which mounts it",
+            plan.target_path
+        )));
+    };
+    let dot_lore = plan.in_progress.join(crate::repository::DOT_LORE);
+    let config = crate::repository::load_repository_config_from_dot_dir(&dot_lore)
+        .forward_any::<InstanceError>("loading the new instance's config")?;
+    mm.fuse()
+        .mount_clone(
+            repository,
+            &plan.destination,
+            (plan.clone_id, &dot_lore),
+            &config,
+        )
+        .await
+        .forward_with::<InstanceError, _>(|| {
+            format!("mounting the new instance at {}", plan.target_path)
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
+async fn mount_fuse_clone(
+    _repository: &RepositoryContext,
+    plan: &InstanceClonePlan,
+) -> Result<(), InstanceError> {
+    Err(InstanceError::internal(format!(
+        "The instance at {} is a virtual clone, which only Linux serves",
+        plan.source.display()
+    )))
+}
+
+/// Removes the mark of an instance being cloned from the new instance's Lore directory at `dot`,
+/// warning where it cannot: the new instance at `target_path` stands either way.
+async fn remove_clone_mark(dot: &Path, target_path: &str) {
+    if let Err(err) = lore_io::IoDriver::global()
+        .remove_file(dot.join(CLONE_IN_PROGRESS_MARK))
+        .await
+    {
+        lore_warn!("Failed to remove the mark of a clone in progress from {target_path}: {err}");
+    }
+}
+
+/// The Lore directory of the copy `plan` makes, in the copy at `root`: where the source's is in
+/// its tree, or for a virtual clone, in its external directory.
+fn clone_lore_directory(
+    plan: &InstanceClonePlan,
+    root: &Path,
+) -> Result<PathBuf, InstanceCloneError> {
+    if plan.vfs == VfsType::Fuse {
+        return Ok(root.join(crate::repository::DOT_LORE));
+    }
+    Ok(root.join(lore_directory_within(&plan.source, &plan.dot_path)?))
 }
 
 /// Syncs the directory that holds `path` to disk, so a rename into it survives a power loss.
@@ -3226,14 +3441,17 @@ async fn register_clone(
 /// directory a failure left, at background disk priority and retrying while its files are in
 /// use, and the in-progress directory's lock file. The command waits for the removal, which
 /// takes minutes for a large tree; one cut short leaves the directory for the next clone to the
-/// same destination to remove.
+/// same destination to remove, or for a virtual clone, for the next service to start.
 pub async fn instance_clone_finish(plan: InstanceClonePlan) {
     // Shared only with a copy a provider left running after `clone_instance` returned, which
     // keeps the directory, and the lock file, for the next clone to the destination to remove.
-    let Some(lock) = Arc::into_inner(plan.in_progress_lock) else {
+    let Some(mut lock) = Arc::into_inner(plan.in_progress_lock) else {
         return;
     };
-    if is_present(&plan.in_progress).await
+    let placed = plan.placed.load(Ordering::Acquire);
+    lock.remove_file = placed && plan.vfs == VfsType::Fuse;
+    if !placed
+        && is_present(&plan.in_progress).await
         && !remove_clone_directory(
             &plan.in_progress,
             Some(&removing_path(&plan.in_progress)),
@@ -3251,11 +3469,15 @@ pub async fn instance_clone_finish(plan: InstanceClonePlan) {
 /// no in-progress directory left, as when a clone is cancelled before its copy starts or once
 /// the finish has removed the directory, it removes its lock file too; dropped while the
 /// in-progress path itself still exists, it leaves the file for the clone that removes the
-/// directory.
+/// directory, unless [`InProgressLock::remove_file`] says the path stays as the external
+/// directory of a new instance cloned from a virtual clone.
 struct InProgressLock {
     /// Held for the value's life and released after the lock file is removed.
     _lock: FSLock,
     in_progress: PathBuf,
+    /// Set where the in-progress path stays as the placed new instance's external directory, as
+    /// when cloning a virtual clone, so the lock file goes with the lock.
+    remove_file: bool,
 }
 
 impl Drop for InProgressLock {
@@ -3264,7 +3486,7 @@ impl Drop for InProgressLock {
     fn drop(&mut self) {
         // A stat and an unlink, run once as a clone ends, and run while the lock is still held,
         // as the field drops after this.
-        if std::fs::symlink_metadata(&self.in_progress).is_err()
+        if (self.remove_file || std::fs::symlink_metadata(&self.in_progress).is_err())
             && let Ok(file) = FSLock::lock_file_of(&self.in_progress)
         {
             let _ = std::fs::remove_file(file);
@@ -3275,19 +3497,24 @@ impl Drop for InProgressLock {
 /// Copies the instance directory as `plan` describes to its in-progress directory. The copy's
 /// Lore directory is first given the mark of a clone in progress, the clone's instance file and
 /// the mark of an instance holding no store records, and the copy is then made through the
-/// plan's provider, with a `Copying` progress event sent with its counts each event interval.
+/// plan's provider, with a `Copying` progress event sent with its counts each event interval. A
+/// virtual clone's mark names its destination, whose empty mount point a service that starts
+/// after a crash removes.
 async fn copy_instance_directory(
     repository: &Arc<RepositoryContext>,
     plan: &InstanceClonePlan,
 ) -> Result<CloneStats, InstanceCloneError> {
-    let dot = plan
-        .in_progress
-        .join(lore_directory_within(&plan.source, &plan.dot_path)?);
+    let dot = clone_lore_directory(plan, &plan.in_progress)?;
     let io = lore_io::IoDriver::global();
     io.create_dir_all(&dot)
         .await
         .map_err(|err| clone_io_failure(err, "creating the clone's Lore directory"))?;
-    io.write_file_bytes(dot.join(CLONE_IN_PROGRESS_MARK), bytes::Bytes::new(), false)
+    let mark = if plan.vfs == VfsType::Fuse {
+        bytes::Bytes::copy_from_slice(plan.destination.as_os_str().as_encoded_bytes())
+    } else {
+        bytes::Bytes::new()
+    };
+    io.write_file_bytes(dot.join(CLONE_IN_PROGRESS_MARK), mark, false)
         .await
         .map_err(|err| clone_io_failure(err, "marking the clone as in progress"))?;
     plan.clone_id

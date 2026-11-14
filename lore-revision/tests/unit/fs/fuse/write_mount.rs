@@ -11285,21 +11285,6 @@ fn set_host_time(instance: &Instance, name: &str, mtime: std::time::SystemTime) 
         .expect("a modified time");
 }
 
-/// Waits until the filesystem stamps later than the time the provider measures `write/<name>`
-/// at, the later of its modification and its status change, so that a commit from now on
-/// records it. Setting a time stamps the status change with the current tick, and a commit
-/// whose clock reads that tick records no time it cannot tell apart from a later write.
-async fn wait_past_host_time(instance: &Instance, fs: &Arc<FuseFilesystem>, name: &str) {
-    let metadata = std::fs::metadata(instance.write_dir().join(name)).expect(name);
-    let millis = |seconds: i64, nanos: i64| {
-        u64::try_from(seconds).unwrap_or_default() * 1000
-            + u64::try_from(nanos).unwrap_or_default() / 1_000_000
-    };
-    let measured = millis(metadata.mtime(), metadata.mtime_nsec())
-        .max(millis(metadata.ctime(), metadata.ctime_nsec()));
-    lore_revision::state::wait_until_settled(&instance.command_context(fs, None), measured).await;
-}
-
 /// The State of `revision`, loaded afresh.
 async fn state_at(instance: &Instance, revision: Hash) -> Arc<lore_revision::state::State> {
     lore_revision::state::State::deserialize(instance.fixture.repository.clone(), revision)
@@ -13384,11 +13369,10 @@ async fn a_staged_temporary_saved_over_its_name_leaves_the_staged_state() {
         .await;
 }
 
-/// A local file last changed before a commit read the filesystem clock has the time the commit
-/// read it at recorded, the later of its modification and status change: the fixture's clock
-/// reads.
+/// A local file last modified before a commit read the filesystem clock has its modification time
+/// recorded, the time the file shows, though its status changed since.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_commit_records_the_time_of_a_local_file_written_before_its_clock() {
+async fn a_commit_records_the_modification_time_of_a_local_file_written_before_its_clock() {
     let instance = Instance::new(&[("a.txt", b"alpha")]).await;
     LORE_CONTEXT
         .scope(fuse_fixture::setup_test_execution(), async {
@@ -13405,16 +13389,8 @@ async fn a_commit_records_the_time_of_a_local_file_written_before_its_clock() {
                 .expect("a.txt")
                 .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
                 .expect("an older time");
-            let changed = {
-                use std::os::unix::fs::MetadataExt as _;
-
-                let metadata = std::fs::metadata(&host).expect("a.txt");
-                let ctime = u64::try_from(metadata.ctime()).expect("a time") * 1000
-                    + u64::try_from(metadata.ctime_nsec()).expect("a time") / 1_000_000;
-                lore_revision::util::fs::file_mtime(&metadata).max(ctime)
-            };
-            // Past the change's tick, so the commit's clock reads later than it.
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let modified =
+                lore_revision::util::fs::file_mtime(&std::fs::metadata(&host).expect("a.txt"));
 
             commit_through(&instance, &fs, false).await.expect("commit");
             assert_eq!(
@@ -13424,8 +13400,36 @@ async fn a_commit_records_the_time_of_a_local_file_written_before_its_clock() {
                         .expect("a path"),
                 )
                 .await,
-                changed
+                modified
             );
+        })
+        .await;
+}
+
+/// A local file modified in or after the tick a commit reads its clock in has its modification time
+/// recorded too: a virtual clone compares no file by time, so no time is too recent to record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_records_the_modification_time_of_a_local_file_written_after_its_clock() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), ino, 0, 0, b"ONE..", 0)
+                .await
+                .expect("write");
+            fs.forget(ino, 1);
+            set_host_time(
+                &instance,
+                "a.txt",
+                std::time::SystemTime::now() + Duration::from_secs(3600),
+            );
+            let modified = lore_revision::util::fs::file_mtime(
+                &std::fs::metadata(instance.write_dir().join("a.txt")).expect("a.txt"),
+            );
+
+            commit_through(&instance, &fs, false).await.expect("commit");
+            assert_eq!(recorded_time(&instance, &fs, "a.txt").await, modified);
         })
         .await;
 }
@@ -13440,9 +13444,8 @@ async fn recorded_time(instance: &Instance, fs: &Arc<FuseFilesystem>, path: &str
 }
 
 /// A save over a file inside a commit, after the commit read the file's time and in the same
-/// timestamp tick, at the same size, is staged by the next commit: the commit recorded no time
-/// it could not tell apart from a later write. The tick is forced, as a coarse clock makes it.
-/// A file changed before the commit's clock has its time recorded, so the clock was read.
+/// timestamp tick, at the same size, is staged by the next commit: a virtual clone compares files
+/// by content. The tick is forced, as a coarse clock makes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_save_in_the_commits_timestamp_tick_is_staged_by_the_next_commit() {
     use std::sync::atomic::AtomicBool;
@@ -13467,8 +13470,6 @@ async fn a_save_in_the_commits_timestamp_tick_is_staged_by_the_next_commit() {
                 "b.txt",
                 std::time::SystemTime::now() - Duration::from_secs(3600),
             );
-            // Past the change's tick, so the commit's clock reads later than it.
-            tokio::time::sleep(Duration::from_millis(20)).await;
             // Written in the tick the commit reads its clock in: a time no older than the clock.
             let host = instance.write_dir().join("a.txt");
             let tick = std::time::SystemTime::now() + Duration::from_secs(3600);
@@ -13513,7 +13514,7 @@ async fn a_save_in_the_commits_timestamp_tick_is_staged_by_the_next_commit() {
             assert_ne!(
                 recorded_time(&instance, &fs, "b.txt").await,
                 0,
-                "the commit recorded a time for b.txt: its clock read"
+                "the commit recorded a time for b.txt"
             );
             let revision = commit_through(&instance, &fs, false)
                 .await
@@ -13531,7 +13532,7 @@ async fn a_save_in_the_commits_timestamp_tick_is_staged_by_the_next_commit() {
 
 /// A save's temporary written in the millisecond of the file it saves over, before a commit, and
 /// renamed over the file after the commit recorded the file's time, is staged by the next commit:
-/// the file renamed onto the name never matches the time recorded for the one it replaced.
+/// a virtual clone compares files by content, whatever their times.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_temporary_from_the_files_millisecond_renamed_over_it_after_a_commit_is_staged() {
     let instance = Arc::new(Instance::new(&[("a.txt", b"alpha")]).await);
@@ -13545,7 +13546,6 @@ async fn a_temporary_from_the_files_millisecond_renamed_over_it_after_a_commit_i
             fs.forget(ino, 1);
             let millisecond = std::time::SystemTime::now() - Duration::from_secs(3600);
             set_host_time(&instance, "a.txt", millisecond);
-            wait_past_host_time(&instance, &fs, "a.txt").await;
             stage_through(&instance, &fs).await.expect("stage a.txt");
             let temporary = create_with(&fs, ROOT_INO, "a.txt.tmp", b"TWO..").await;
             set_host_time(&instance, "a.txt.tmp", millisecond);
@@ -13590,7 +13590,6 @@ async fn a_file_created_after_an_unlink_with_the_recorded_time_is_staged() {
             fs.forget(ino, 1);
             let millisecond = std::time::SystemTime::now() - Duration::from_secs(3600);
             set_host_time(&instance, "a.txt", millisecond);
-            wait_past_host_time(&instance, &fs, "a.txt").await;
             stage_through(&instance, &fs).await.expect("stage a.txt");
             commit_staged(&instance, &fs).await.expect("commit a.txt");
             assert_ne!(

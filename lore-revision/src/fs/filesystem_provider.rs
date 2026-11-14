@@ -1218,8 +1218,12 @@ impl InstanceOperationImpl {
 
     /// The filesystem clock of `repository`'s working copy as the operation first asked for it,
     /// read then ([`crate::state::read_clock_floor`]): a file the operation reads after asking
-    /// may record its time only where it is older, so no write after the read shares it.
+    /// may record its time only where it is older, so no write after the read shares it. No
+    /// floor, `u64::MAX`, for a provider that holds its state: it compares no file by time.
     pub async fn clock_floor(&self, repository: &RepositoryContext) -> u64 {
+        if self.holds_state {
+            return u64::MAX;
+        }
         *self
             .clock_floor
             .get_or_init(|| crate::state::read_clock_floor(repository))

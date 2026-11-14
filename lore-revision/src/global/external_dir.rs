@@ -15,12 +15,15 @@ const EXTERNAL: &str = "external";
 /// The directory in an instance's external directory holding what its mount wrote.
 pub const WRITE_DIR: &str = "write";
 
-pub fn external_dir_for_instance(instance_id: InstanceId) -> Result<PathBuf, ExternalDirError> {
+/// The directory holding every instance's external directory.
+pub fn external_dirs_root() -> Result<PathBuf, ExternalDirError> {
     let global =
         get_global_data_dir().forward::<ExternalDirError>("Missing global data directory")?;
-    Ok(global
-        .join(EXTERNAL)
-        .join(Path::new(instance_id.text_encoding().as_str())))
+    Ok(global.join(EXTERNAL))
+}
+
+pub fn external_dir_for_instance(instance_id: InstanceId) -> Result<PathBuf, ExternalDirError> {
+    Ok(external_dirs_root()?.join(Path::new(instance_id.text_encoding().as_str())))
 }
 
 pub fn external_lore_dir(instance_id: InstanceId) -> Result<PathBuf, ExternalDirError> {

@@ -116,11 +116,16 @@ async fn a_store_that_cannot_be_opened_is_skipped() {
             );
             assert!(!opened(readable_store.path()));
 
-            let (mounted, pending) = MountManager::mounts_of_entries(registry.entries())
-                .await
-                .expect("mounting past the store that cannot be opened succeeds");
+            let (mounted, pending, registered) =
+                MountManager::mounts_of_entries(registry.entries())
+                    .await
+                    .expect("mounting past the store that cannot be opened succeeds");
 
             assert!(mounted.is_empty() && pending.is_empty());
+            assert_eq!(
+                registered, None,
+                "the instances of a store that cannot be opened are unknown"
+            );
             assert!(
                 opened(readable_store.path()),
                 "the walk opens the store after the skipped one"
@@ -173,11 +178,16 @@ async fn a_store_whose_instances_cannot_be_listed_is_skipped() {
             drop(reopened);
             assert!(!opened(readable_store.path()));
 
-            let (mounted, pending) = MountManager::mounts_of_entries(registry.entries())
-                .await
-                .expect("mounting past the unlisted store succeeds");
+            let (mounted, pending, registered) =
+                MountManager::mounts_of_entries(registry.entries())
+                    .await
+                    .expect("mounting past the unlisted store succeeds");
 
             assert!(mounted.is_empty() && pending.is_empty());
+            assert_eq!(
+                registered, None,
+                "the instances of a store that cannot be listed are unknown"
+            );
             assert!(
                 opened(readable_store.path()),
                 "the walk opens the store after the skipped one"
@@ -220,7 +230,7 @@ async fn an_instance_whose_config_cannot_be_read_is_skipped() {
             );
             assert!(!opened(next_store.path()));
 
-            let (mounted, pending) = MountManager::mounts_of_entries(registry.entries())
+            let (mounted, pending, _) = MountManager::mounts_of_entries(registry.entries())
                 .await
                 .expect("mounting past the unreadable instance succeeds");
 
@@ -263,7 +273,7 @@ async fn an_unlistable_store_does_not_stop_the_others() {
         "the sealed store opens"
     );
 
-    let (mounted, pending) = MountManager::mounts_of_entries(registry.entries())
+    let (mounted, pending, _) = MountManager::mounts_of_entries(registry.entries())
         .await
         .expect("mounting past the unlistable store succeeds");
 
@@ -321,7 +331,7 @@ async fn a_store_whose_instances_cannot_be_listed_does_not_stop_the_others() {
     );
     let instance_id = register_fuse_instance(&registry.entries()[1], "").await;
 
-    let (mounted, pending) = MountManager::mounts_of_entries(registry.entries())
+    let (mounted, pending, _) = MountManager::mounts_of_entries(registry.entries())
         .await
         .expect("mounting past the unlisted store succeeds");
 
@@ -363,13 +373,21 @@ async fn an_unreadable_instance_does_not_stop_the_rest_of_its_store() {
 
     let readable_id = register_fuse_instance(entry, "").await;
 
-    let (mounted, pending) = MountManager::mounts_of_entries(registry.entries())
+    let (mounted, pending, registered) = MountManager::mounts_of_entries(registry.entries())
         .await
         .expect("mounting past the unreadable instance succeeds");
 
     assert!(mounted.is_empty());
     assert_eq!(pending.len(), 1, "only the readable instance is pending");
     assert_eq!(pending[0].instance.instance_id, readable_id);
+    assert_eq!(
+        registered,
+        Some(std::collections::BTreeSet::from([
+            unreadable_id,
+            readable_id
+        ])),
+        "every instance a listed store registers is known, mountable or not"
+    );
 }
 
 /// A path no manager mounts names no instance and leads to no external directory.

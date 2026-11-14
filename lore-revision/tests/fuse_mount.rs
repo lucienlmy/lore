@@ -427,7 +427,7 @@ async fn sync_into_fuse_instance_shows_committed_tree() {
             SyncOptions::default(),
         )
         .await
-        .expect("syncing into the FUSE instance succeeds");
+        .expect("syncing into the virtual clone succeeds");
 
         assert_eq!(list_names(&path).await, vec!["readme.txt", "src"]);
         assert_eq!(list_names(&path.join("src")).await, vec!["main.rs"]);
@@ -2287,4 +2287,621 @@ async fn initialize_remounts_registered_fuse_instances() {
         "child failed:\n{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Removes `path` through the mount, as a program would.
+// A fixture removal through the mount, outside any repository write.
+#[allow(clippy::disallowed_methods)]
+async fn remove_through(path: std::path::PathBuf) {
+    lore_base::lore_spawn_blocking!(move || std::fs::remove_file(&path))
+        .await
+        .expect("remove task completes")
+        .expect("the removal through the mount succeeds");
+}
+
+/// The modification time `path` reports through the mount.
+async fn mtime_of(path: std::path::PathBuf) -> std::time::SystemTime {
+    lore_base::lore_spawn_blocking!(move || std::fs::metadata(&path)?.modified())
+        .await
+        .expect("stat task completes")
+        .expect("stat through the mount succeeds")
+}
+
+/// The name of the file [`synced_fuse_instance`]'s second sync adds, for which that swap records
+/// a time.
+const SWAPPED: &str = "swapped.txt";
+
+/// A virtual clone at `path` on `store`, synced to a revision of `files` committed from an OS
+/// instance, then to one that adds [`SWAPPED`], as syncs swap them in and record them. The first
+/// publish onto the empty revision records no time, so every file of `files` reports the base time,
+/// and the second swap records one for [`SWAPPED`].
+async fn synced_fuse_instance(store: &Path, path: &Path, files: &[(&str, &[u8])]) -> InstanceId {
+    let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+    let (repository, token) = create_instance(
+        path,
+        repository_id,
+        shared_store_config(store, VfsType::Fuse),
+    )
+    .await;
+    let twin = Box::pin(Twin::new(store, repository_id)).await;
+    let first = Box::pin(twin.commit(files)).await;
+    let second = Box::pin(twin.commit(&[(SWAPPED, b"added by the second sync")])).await;
+    let mut served = State::new();
+    for target in [first, second] {
+        let operation = repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("the FUSE provider begins an operation");
+        lore_revision::fs::realize::realize_state(
+            repository.clone(),
+            repository.clone(),
+            operation,
+            served,
+            target.clone(),
+            SyncOptions::default(),
+        )
+        .await
+        .expect("syncing into the virtual clone succeeds");
+        // As a sync records the revision it swapped in, which a mount of the instance serves.
+        lore_revision::instance::store_current_anchor(&repository, target.revision())
+            .await
+            .expect("record the current revision");
+        served = target;
+    }
+    repository
+        .flush(FlushOptions::default())
+        .await
+        .expect("flush the anchors");
+    let instance_id = repository.instance_id;
+    drop(repository);
+    drop(token);
+    instance_id
+}
+
+/// The instances the store of the instance at `path` registers.
+async fn instances_registered_beside(path: &Path) -> Vec<InstanceId> {
+    let repository = load_and_connect(path, RepositoryAccess::ReadOnly)
+        .await
+        .expect("the instance opens");
+    lore_revision::instance::list_instances(&repository)
+        .await
+        .expect("list the instances")
+        .iter()
+        .map(|instance| instance.instance_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Plans cloning the instance at `path` to `destination` over the instance opened without its
+/// stores, as the command plans it in the service, and opens the instance holding its repository
+/// lock alone, as the command then does, for `clone` to clone it with. Finishes cloning whatever
+/// `clone` answers.
+async fn clone_instance_at(
+    path: &Path,
+    destination: &Path,
+    allow_copy: bool,
+    clone: impl AsyncFnOnce(CommandContext, &ClonePlan) -> Result<(), InstanceError>,
+) -> Result<Option<InstanceId>, InstanceError> {
+    let unlocked = lore_revision::repository::load_and_connect_with_token(
+        path,
+        RepositoryAccess::NoStore,
+        None,
+    )
+    .await
+    .expect("the instance opens without its stores");
+    let planned = lore_revision::instance::instance_clone_plan(
+        unlocked.clone(),
+        &destination.display().to_string(),
+        allow_copy,
+    )
+    .await;
+    drop(unlocked);
+    let Some(plan) = planned? else {
+        return Ok(None);
+    };
+    let token = RepositoryWriteToken::acquire(path).await;
+    let repository = lore_revision::repository::load_and_connect_exclusive(path, token.share())
+        .await
+        .expect("the instance opens holding its lock alone");
+    let cloned = clone(repository, &plan).await;
+    drop(token);
+    let clone_id = plan.clone_id();
+    lore_revision::instance::instance_clone_finish(plan).await;
+    cloned.map(|()| Some(clone_id))
+}
+
+type CommandContext = Arc<lore_revision::repository::RepositoryContext>;
+type ClonePlan = lore_revision::instance::InstanceClonePlan;
+type InstanceError = lore_revision::instance::InstanceError;
+
+/// Whether the volume of the external directories clones files, so cloning a virtual clone
+/// shares blocks rather than copying them.
+fn external_dirs_clone_files() -> bool {
+    let root = lore_revision::global::external_dir::external_dirs_root().expect("external root");
+    std::fs::create_dir_all(&root).expect("external root");
+    lore_io::clone::detect(&root, &root)
+        .expect("probe the external directories' volume")
+        .backend
+        .shares_blocks()
+}
+
+/// Cloning a virtual clone mounts a new instance at the destination, on the source's revision,
+/// with a copy of its local changes: the files written through the mount, and the deletions. The
+/// tracked files report the times the source's sync recorded, and a write in the new instance
+/// leaves the source alone. The new instance is registered at the destination with an ID of its
+/// own, and its external directory holds no mark of an instance being cloned.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_clone_of_a_fuse_instance_mounts_its_revision_and_local_changes() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-clone-source-");
+        let (_target_dir, target_parent) = canonical_dir("lore-fuse-mount-clone-target-");
+        let destination = target_parent.join("clone");
+        let _guard = MountGuard(path.clone());
+        let _clone_guard = MountGuard(destination.clone());
+        let source_id = synced_fuse_instance(
+            &store,
+            &path,
+            &[
+                ("readme.txt", b"tracked"),
+                ("gone.txt", b"deleted through the mount"),
+                ("src/main.rs", b"fn main() {}"),
+            ],
+        )
+        .await;
+        write_through(path.join("local.txt"), b"written before cloning").await;
+        remove_through(path.join("gone.txt")).await;
+        let base_time = load_repository_config_from_dot_dir(
+            &external_dir_for_instance(source_id)
+                .expect("external dir")
+                .join(DOT_LORE),
+        )
+        .expect("the source's config")
+        .vfs_base_time();
+        let swapped = mtime_of(path.join(SWAPPED)).await;
+        assert_ne!(
+            swapped,
+            std::time::UNIX_EPOCH + Duration::from_millis(base_time),
+            "the second sync recorded a time of its own"
+        );
+
+        let clone_id = clone_instance_at(
+            &path,
+            &destination,
+            true,
+            async |repository: CommandContext, plan: &ClonePlan| {
+                lore_revision::instance::instance_clone(repository, plan).await
+            },
+        )
+        .await
+        .expect("cloning succeeds")
+        .expect("not a dry run");
+
+        assert!(is_mounted(&destination), "the new instance is mounted");
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        let mounted = manager.fuse().mounted(&destination).expect("and tracked");
+        assert_eq!(mounted.instance_id, clone_id);
+        assert_ne!(clone_id, source_id, "the new instance has an ID of its own");
+        assert_eq!(
+            list_names(&destination).await,
+            vec!["local.txt", "readme.txt", "src", SWAPPED]
+        );
+        assert_eq!(read_file(destination.join("readme.txt")).await, b"tracked");
+        assert_eq!(
+            read_file(destination.join("local.txt")).await,
+            b"written before cloning"
+        );
+        assert_eq!(
+            mtime_of(destination.join(SWAPPED)).await,
+            swapped,
+            "the new instance reports the time the source's sync recorded"
+        );
+        let clone_external = external_dir_for_instance(clone_id).expect("external dir");
+        assert!(
+            clone_external.join(DOT_LORE).is_dir(),
+            "the new instance keeps its external directory"
+        );
+        assert!(
+            !clone_external
+                .join(DOT_LORE)
+                .join(lore_revision::instance::CLONE_IN_PROGRESS_MARK)
+                .exists(),
+            "the new instance is no longer marked as being cloned"
+        );
+
+        write_through(
+            destination.join("local.txt"),
+            b"rewritten in the new instance",
+        )
+        .await;
+        assert_eq!(
+            read_file(path.join("local.txt")).await,
+            b"written before cloning",
+            "the source keeps its own copy"
+        );
+        let registered = load_and_connect(&destination, RepositoryAccess::ReadOnly)
+            .await
+            .expect("the new instance opens at its destination");
+        assert_eq!(registered.instance_id, clone_id);
+        let instances = lore_revision::instance::list_instances(&registered)
+            .await
+            .expect("list the instances");
+        assert!(
+            instances
+                .iter()
+                .any(|instance| instance.instance_id == clone_id
+                    && Path::new(&instance.path) == destination),
+            "the new instance is registered at its destination: {instances:?}"
+        );
+        drop(registered);
+        for mounted in [&destination, &path] {
+            manager
+                .fuse()
+                .unmount(mounted, false)
+                .await
+                .expect("unmounts");
+        }
+    }))
+    .await;
+}
+
+/// Cloning a virtual clone whose registration fails undoes everything: nothing is mounted at the
+/// destination, which is not made, the new instance is not registered, and its external directory
+/// is removed once cloning is finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_clone_of_a_fuse_instance_that_fails_to_register_leaves_nothing() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-clone-source-");
+        let (_target_dir, target_parent) = canonical_dir("lore-fuse-mount-clone-target-");
+        let destination = target_parent.join("clone");
+        let _guard = MountGuard(path.clone());
+        let _clone_guard = MountGuard(destination.clone());
+        synced_fuse_instance(&store, &path, &[("readme.txt", b"tracked")]).await;
+        write_through(path.join("local.txt"), b"local").await;
+        let registered = instances_registered_beside(&path).await;
+        let before = names_in(
+            &lore_revision::global::external_dir::external_dirs_root().expect("external root"),
+        );
+
+        let failed = clone_instance_at(
+            &path,
+            &destination,
+            true,
+            async |repository: CommandContext, plan: &ClonePlan| {
+                let failed = lore_revision::instance::instance_clone_with(
+                    repository,
+                    plan,
+                    lore_revision::instance::move_clone_into_place,
+                    async |_: &CommandContext, _: InstanceId, _: &str| {
+                        Err(InstanceError::internal("refused"))
+                    },
+                )
+                .await;
+                assert!(
+                    plan.in_progress().is_dir(),
+                    "the external directory stays until cloning is finished"
+                );
+                failed
+            },
+        )
+        .await;
+
+        assert!(failed.is_err(), "cloning fails");
+        assert!(!is_mounted(&destination), "nothing is mounted");
+        assert!(!destination.exists(), "no mount point is made");
+        assert_eq!(
+            names_in(
+                &lore_revision::global::external_dir::external_dirs_root().expect("external root")
+            ),
+            before,
+            "the new instance's external directory is removed"
+        );
+        assert_eq!(
+            instances_registered_beside(&path).await,
+            registered,
+            "the new instance is not registered"
+        );
+        assert_eq!(read_file(path.join("local.txt")).await, b"local");
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        manager
+            .fuse()
+            .unmount(&path, false)
+            .await
+            .expect("unmounts");
+    }))
+    .await;
+}
+
+/// Cloning a virtual clone to a destination another takes after the plan, as a second cloning to
+/// the same path does, is refused as a taken destination before it registers, so it retires no
+/// registration there, and leaves the directory found there alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_clone_whose_destination_is_taken_is_refused_before_it_registers() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-clone-source-");
+        let (_target_dir, target_parent) = canonical_dir("lore-fuse-mount-clone-target-");
+        let destination = target_parent.join("clone");
+        let _guard = MountGuard(path.clone());
+        let _clone_guard = MountGuard(destination.clone());
+        synced_fuse_instance(&store, &path, &[("readme.txt", b"tracked")]).await;
+        let registered = instances_registered_beside(&path).await;
+        let before = names_in(
+            &lore_revision::global::external_dir::external_dirs_root().expect("external root"),
+        );
+
+        let taken = destination.clone();
+        let registering = std::sync::atomic::AtomicBool::new(false);
+        let failed = clone_instance_at(
+            &path,
+            &destination,
+            true,
+            async |repository: CommandContext, plan: &ClonePlan| {
+                std::fs::create_dir(&taken).expect("take the destination");
+                lore_revision::instance::instance_clone_with(
+                    repository,
+                    plan,
+                    lore_revision::instance::move_clone_into_place,
+                    async |repository: &CommandContext, clone: InstanceId, target: &str| {
+                        registering.store(true, Ordering::SeqCst);
+                        lore_revision::instance::register_clone(repository, clone, target).await
+                    },
+                )
+                .await
+            },
+        )
+        .await;
+
+        let error = failed.expect_err("cloning fails");
+        assert!(error.is_invalid_arguments(), "unexpected error: {error}");
+        assert!(
+            !registering.load(Ordering::SeqCst),
+            "cloning is refused before it registers"
+        );
+        assert!(!is_mounted(&destination), "nothing is mounted");
+        assert!(
+            destination.is_dir() && names_in(&destination).is_empty(),
+            "the directory found there stays"
+        );
+        assert_eq!(instances_registered_beside(&path).await, registered);
+        assert_eq!(
+            names_in(
+                &lore_revision::global::external_dir::external_dirs_root().expect("external root")
+            ),
+            before,
+            "the new instance's external directory is removed"
+        );
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        manager
+            .fuse()
+            .unmount(&path, false)
+            .await
+            .expect("unmounts");
+    }))
+    .await;
+}
+
+/// Cloning a virtual clone whose mount a stop refuses removes the mount point it made and the new
+/// instance's registration, and its external directory once cloning is finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_clone_of_a_fuse_instance_whose_mount_is_refused_leaves_nothing() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-clone-source-");
+        let (_target_dir, target_parent) = canonical_dir("lore-fuse-mount-clone-target-");
+        let destination = target_parent.join("clone");
+        let _guard = MountGuard(path.clone());
+        let _clone_guard = MountGuard(destination.clone());
+        let source_id = synced_fuse_instance(&store, &path, &[("readme.txt", b"tracked")]).await;
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        let _resume = ResumeMounting(manager.clone());
+        let before = names_in(
+            &lore_revision::global::external_dir::external_dirs_root().expect("external root"),
+        );
+
+        let stopping = manager.clone();
+        let failed = clone_instance_at(
+            &path,
+            &destination,
+            true,
+            async |repository: CommandContext, plan: &ClonePlan| {
+                stopping
+                    .fuse()
+                    .unmount_all(false)
+                    .await
+                    .expect("the stop goes ahead");
+                lore_revision::instance::instance_clone(repository, plan).await
+            },
+        )
+        .await;
+
+        assert!(failed.is_err(), "cloning fails");
+        assert!(!is_mounted(&destination), "nothing is mounted");
+        assert!(!destination.exists(), "the mount point it made is removed");
+        assert_eq!(
+            names_in(
+                &lore_revision::global::external_dir::external_dirs_root().expect("external root")
+            ),
+            before,
+            "the new instance's external directory is removed"
+        );
+        assert!(
+            external_dir_for_instance(source_id)
+                .expect("external dir")
+                .is_dir(),
+            "the source keeps its external directory"
+        );
+    }))
+    .await;
+}
+
+/// Cloning a virtual clone onto a volume that cannot clone files is refused without a copy
+/// allowed, before anything is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_clone_of_a_fuse_instance_that_would_copy_needs_a_copy_allowed() {
+    skip_without_fuse!();
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        if external_dirs_clone_files() {
+            return;
+        }
+        let (_store_dir, store) = canonical_dir("lore-fuse-mount-store-");
+        let (_dir, path) = canonical_dir("lore-fuse-mount-clone-source-");
+        let (_target_dir, target_parent) = canonical_dir("lore-fuse-mount-clone-target-");
+        let destination = target_parent.join("clone");
+        let _guard = MountGuard(path.clone());
+        synced_fuse_instance(&store, &path, &[("readme.txt", b"tracked")]).await;
+        let before = names_in(
+            &lore_revision::global::external_dir::external_dirs_root().expect("external root"),
+        );
+
+        let refused = clone_instance_at(
+            &path,
+            &destination,
+            false,
+            async |_: CommandContext, _: &ClonePlan| -> Result<(), InstanceError> {
+                panic!("a refused clone is not made")
+            },
+        )
+        .await;
+
+        let error = refused.expect_err("cloning is refused");
+        assert!(error.is_not_supported(), "unexpected error: {error}");
+        assert!(!destination.exists());
+        assert_eq!(
+            names_in(
+                &lore_revision::global::external_dir::external_dirs_root().expect("external root")
+            ),
+            before,
+            "no external directory is written"
+        );
+        let manager = MountManagerState::mount_manager().expect("manager is initialised");
+        manager
+            .fuse()
+            .unmount(&path, false)
+            .await
+            .expect("unmounts");
+    }))
+    .await;
+}
+
+/// A start removes what a crash left while cloning among the external directories: a marked
+/// external directory no instance is registered for, with the empty mount point its mark names,
+/// one a removal renamed aside, and a lock file no clone holds. It keeps a marked one whose
+/// instance is registered, removing only its mark, one whose lock another clone holds, and every
+/// other entry. Where some instances are unknown it removes no marked directory.
+#[tokio::test(flavor = "multi_thread")]
+// Fixtures written and cleaned up beside the new instances, outside any repository write.
+#[allow(clippy::disallowed_methods)]
+async fn a_start_removes_what_interrupted_clones_left_and_keeps_registered_clones() {
+    let _serial = SERIAL.lock().await;
+    let execution = service_execution().await;
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        use lore_base::fs::lock::FSLock;
+        use lore_revision::fs::fuse::mount_manager::remove_interrupted_clones;
+        use lore_revision::instance::CLONE_IN_PROGRESS_MARK;
+
+        let root = lore_revision::global::external_dir::external_dirs_root().expect("root");
+        let (_target_dir, target_parent) = canonical_dir("lore-fuse-mount-sweep-target-");
+        let marked = |id: InstanceId, names: &Path| {
+            let dot = root.join(id.text_encoding()).join(DOT_LORE);
+            std::fs::create_dir_all(&dot).expect("a Lore directory");
+            test_file_write(
+                &dot.join(CLONE_IN_PROGRESS_MARK),
+                names.as_os_str().as_encoded_bytes(),
+            );
+            test_file_write(&root.join(id.text_encoding()).join("deleted"), b"a\n");
+        };
+        let (unregistered, registered, held, unmarked, stray) = (
+            InstanceId::generate(),
+            InstanceId::generate(),
+            InstanceId::generate(),
+            InstanceId::generate(),
+            InstanceId::generate(),
+        );
+        let mount_point = target_parent.join("made");
+        std::fs::create_dir(&mount_point).expect("the mount point cloning made");
+        let filled = target_parent.join("filled");
+        std::fs::create_dir(&filled).expect("a directory holding a file");
+        test_file_write(&filled.join("kept.txt"), b"kept");
+        marked(unregistered, &mount_point);
+        marked(registered, &target_parent.join("registered"));
+        marked(held, &filled);
+        let held_lock = FSLock::try_acquire_file_lock(root.join(held.text_encoding()))
+            .expect("lock")
+            .expect("the lock of an instance still being cloned");
+        let unmarked_dot = root.join(unmarked.text_encoding()).join(DOT_LORE);
+        std::fs::create_dir_all(&unmarked_dot).expect("a Lore directory");
+        let aside = root.join(format!(
+            "{}.removing",
+            InstanceId::generate().text_encoding()
+        ));
+        std::fs::create_dir_all(aside.join("write")).expect("a removal cut short");
+        let stray_lock = root.join(format!("{}.lock", stray.text_encoding()));
+        test_file_write(&stray_lock, b"");
+        let other = root.join("not-an-instance.removing");
+        std::fs::create_dir_all(&other).expect("another entry");
+
+        remove_interrupted_clones(None).await;
+        assert!(
+            root.join(unregistered.text_encoding()).exists(),
+            "with instances unknown, no marked directory is removed"
+        );
+        assert!(mount_point.is_dir());
+        assert!(!aside.exists(), "a removal cut short is finished");
+        assert!(
+            !stray_lock.exists(),
+            "a lock file no clone holds is removed"
+        );
+
+        remove_interrupted_clones(Some(&std::collections::BTreeSet::from([registered]))).await;
+        assert!(!root.join(unregistered.text_encoding()).exists());
+        assert!(
+            !mount_point.exists(),
+            "with the empty mount point its mark names"
+        );
+        let kept = root.join(registered.text_encoding());
+        assert!(kept.join("deleted").is_file(), "a registered clone stays");
+        assert!(!kept.join(DOT_LORE).join(CLONE_IN_PROGRESS_MARK).exists());
+        assert!(
+            root.join(held.text_encoding()).join("deleted").is_file(),
+            "an instance whose lock another holds stays"
+        );
+        assert!(filled.join("kept.txt").is_file());
+        assert!(unmarked_dot.is_dir(), "an unmarked directory stays");
+        assert!(
+            !root
+                .join(format!("{}.lock", unmarked.text_encoding()))
+                .exists(),
+            "and gets no lock file"
+        );
+        assert!(other.is_dir(), "an entry no clone names stays");
+        drop(held_lock);
+        for left in [
+            kept,
+            root.join(held.text_encoding()),
+            root.join(unmarked.text_encoding()),
+            other,
+        ] {
+            std::fs::remove_dir_all(left).expect("clean up");
+        }
+        let _ = std::fs::remove_file(root.join(format!("{}.lock", held.text_encoding())));
+    }))
+    .await;
 }

@@ -12,6 +12,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::error::MountsBusy;
+use lore_base::error::NotSupported;
 use lore_error_set::prelude::*;
 use lore_fuse::FuseError;
 use lore_fuse::init::InitConfig;
@@ -22,11 +23,15 @@ use lore_fuse::mount::MountOptions;
 use lore_fuse::session::Session;
 use lore_fuse::session::SessionConfig;
 use lore_fuse::transport::device::DeviceTransport;
+use lore_io::clone::CloneStats;
 use lore_storage::FlushOptions;
 use parking_lot::Mutex;
 
+use crate::fs::filesystem_provider::CloneAnswer;
+use crate::fs::filesystem_provider::CloneRun;
 use crate::fs::filesystem_provider::FilesystemProvider;
 use crate::fs::filesystem_provider::FsError;
+use crate::fs::filesystem_provider::InstanceCloneError;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::fs::fuse::access_recorder::AccessRecorder;
@@ -459,5 +464,42 @@ impl FilesystemProvider for FuseFilesystemProvider {
             .read_held_file(path)
             .await
             .forward_any::<FsError>("reading a file the mount serves")
+    }
+
+    /// What cloning the mount's instance does: its external directory is cloned beside it, as
+    /// [`crate::fs::fuse::clone::answer`] probes, whatever the destination, which only takes the
+    /// new instance's mount. A read-only mount, which has no external directory, cannot be cloned.
+    async fn clone_answer(
+        &self,
+        _source: &Path,
+        _dot_path: &Path,
+        _destination: &Path,
+    ) -> Result<CloneAnswer, InstanceCloneError> {
+        match &self.mount.external_dir {
+            Some(external) => crate::fs::fuse::clone::answer(external).await,
+            None => Ok(CloneAnswer::Unsupported {
+                reason: "a read-only mount cannot be cloned".to_string(),
+            }),
+        }
+    }
+
+    /// Clones the mount's external directory into `destination`, the new instance's external
+    /// directory, as [`crate::fs::fuse::clone::clone`] does.
+    async fn clone_instance(
+        &self,
+        _source: &Path,
+        _dot_path: &Path,
+        destination: &Path,
+        answer: &CloneAnswer,
+        copy_unclonable: bool,
+        run: &CloneRun,
+    ) -> Result<CloneStats, InstanceCloneError> {
+        let Some(external) = &self.mount.external_dir else {
+            return Err(NotSupported {
+                operation: "cloning a read-only mount".to_string(),
+            }
+            .into());
+        };
+        crate::fs::fuse::clone::clone(external, destination, answer, copy_unclonable, run).await
     }
 }

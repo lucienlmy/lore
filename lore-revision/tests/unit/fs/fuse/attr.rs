@@ -8,9 +8,15 @@ use lore_base::types::Address;
 use lore_revision::fs::fuse::attr::AttrContext;
 use lore_revision::fs::fuse::attr::RecordedTimes;
 use lore_revision::fs::fuse::attr::attr_for;
+use lore_revision::fs::fuse::attr::marker_key;
 use lore_revision::fs::fuse::attr::statfs;
 use lore_revision::fs::fuse::inode::InodeEntry;
 use lore_revision::fs::fuse::inode::InodeKind;
+use lore_revision::records::InstanceRecords;
+use lore_revision::records::Lookup;
+use lore_revision::records::RECORDS_DIR;
+use lore_revision::records::Record;
+use lore_revision::records::RecordBatch;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::util::path::RelativePath;
 
@@ -161,6 +167,152 @@ async fn mtime_uses_base_time_when_no_recorded_time() {
         !RecordedTimes::load(&repository).await.none(),
         "a later mount finds the marker"
     );
+}
+
+/// Two instances on one store, each with a Lore directory and a write token, run under the
+/// fixture's execution context.
+async fn two_instances(
+    work: impl AsyncFnOnce(&super::fuse_fixture::TestRepository, &super::fuse_fixture::TestRepository),
+) {
+    let (immutable_store, mutable_store, execution) = super::fuse_fixture::test_store_create()
+        .await
+        .expect("test store");
+    lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async move {
+            let repository_id = lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7());
+            let source = super::fuse_fixture::test_repository_create(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            )
+            .await;
+            let clone = super::fuse_fixture::test_repository_create(
+                immutable_store,
+                mutable_store,
+                repository_id,
+            )
+            .await;
+            work(&source, &clone).await;
+        })
+        .await;
+}
+
+/// The directory holding the modified-time records of `repository`'s instance.
+fn records_of(repository: &RepositoryContext) -> std::path::PathBuf {
+    repository
+        .dot_dir_path()
+        .expect("a Lore directory")
+        .join(RECORDS_DIR)
+}
+
+/// A swap's times land in the instance's records, with nothing in the mutable store, and a copy
+/// of the records gives another instance the same times.
+#[tokio::test]
+async fn swap_times_are_kept_in_the_instance_records_and_a_copy_carries_them() {
+    two_instances(async |source, clone| {
+        let repository = &source.repository;
+        let path = RelativePath::new_from_initial_path("dir/swapped.txt").expect("path");
+        let times = RecordedTimes::load(repository).await;
+        assert!(times.none());
+        times
+            .store(repository, std::iter::once(&path), 999)
+            .await
+            .expect("store the swap's time");
+        assert_eq!(times.mtime_for(repository, &path, 777).await, 999);
+        assert_eq!(
+            lore_revision::state::stored_modified_time(repository, marker_key(repository)).await,
+            0,
+            "the mutable store holds no marker"
+        );
+        drop(times);
+        let reloaded = RecordedTimes::load(repository).await;
+        assert!(!reloaded.none(), "a later mount finds the shard");
+        assert_eq!(reloaded.mtime_for(repository, &path, 777).await, 999);
+
+        let copied = records_of(&clone.repository);
+        std::fs::create_dir_all(&copied).expect("the copy's records");
+        for entry in std::fs::read_dir(records_of(repository)).expect("list") {
+            let entry = entry.expect("entry");
+            if entry.file_name().len() == 2 {
+                std::fs::copy(entry.path(), copied.join(entry.file_name())).expect("copy");
+            }
+        }
+        let carried = RecordedTimes::load(&clone.repository).await;
+        assert!(!carried.none());
+        assert_eq!(
+            carried.mtime_for(&clone.repository, &path, 777).await,
+            999,
+            "the copy reports the source's time"
+        );
+        let other = RelativePath::new_from_initial_path("dir/other.txt").expect("path");
+        assert_eq!(carried.mtime_for(&clone.repository, &other, 777).await, 777);
+    })
+    .await;
+}
+
+/// The mount reads and writes the records the instance's commands hold: a time a command records
+/// opens the gate and is reported at once, and neither the mount's write-back nor the command's
+/// writes a shard over a time the other recorded in it.
+#[tokio::test]
+async fn the_mount_shares_the_records_of_the_instances_commands() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(super::fuse_fixture::setup_test_execution(), async {
+            let (repository, _directory) = crate::helper::committed_repository("", &[]).await;
+            let salt = repository.salt();
+            let record_key = |path: &RelativePath| {
+                lore_revision::state::file_modified_time_record_key(salt, path)
+            };
+            let committed = RelativePath::new_from_initial_path("committed.txt").expect("path");
+            let swapped = (0..)
+                .map(|index| {
+                    RelativePath::new_from_initial_path(format!("swapped-{index}.txt"))
+                        .expect("path")
+                })
+                .find(|path| record_key(path)[0] == record_key(&committed)[0])
+                .expect("a path in the same shard");
+            let command = repository
+                .instance_records()
+                .expect("the instance keeps its records")
+                .clone();
+            let mut batch = RecordBatch::with_capacity(1);
+            batch.push(Record::new(record_key(&committed), 500));
+            command
+                .set_all(batch)
+                .await
+                .expect("record as a commit does");
+
+            let times = RecordedTimes::load(&repository).await;
+            assert!(!times.none(), "the command's record opens the gate");
+            assert_eq!(times.mtime_for(&repository, &committed, 7).await, 500);
+            times
+                .store(&repository, std::iter::once(&swapped), 900)
+                .await
+                .expect("store the swap's time");
+            command
+                .write_back(
+                    repository.try_write_token().expect("a write token"),
+                    false,
+                    (),
+                )
+                .await
+                .expect("write the command's records back");
+            let dot_path = repository
+                .dot_dir_path()
+                .expect("a Lore directory")
+                .to_path_buf();
+            drop((times, command, repository));
+
+            let reopened = InstanceRecords::open(&dot_path).await;
+            assert_eq!(
+                reopened.lookup(&record_key(&committed)).await,
+                Lookup::Recorded(500)
+            );
+            assert_eq!(
+                reopened.lookup(&record_key(&swapped)).await,
+                Lookup::Recorded(900)
+            );
+        })
+        .await;
 }
 
 #[test]

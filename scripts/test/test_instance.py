@@ -748,7 +748,8 @@ def other_volume(scratch_dir):
 
 @pytest.mark.smoke
 @pytest.mark.own_vfs(
-    "an instance clone copies an on-disk instance; a virtual instance's provider refuses it"
+    "checks what cloning an on-disk instance writes in and beside its destination; "
+    "test_fuse.py clones virtual clones"
 )
 class TestInstanceClone:
     """Tests for `lore repository instance clone`."""

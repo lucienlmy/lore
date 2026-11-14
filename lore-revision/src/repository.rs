@@ -2079,9 +2079,10 @@ pub(crate) fn force_may_replace(path: &Path, dot_path: &Path) -> bool {
 /// strong reference is released.
 #[lore_macro::test_pub]
 pub(crate) struct RepositoryLock {
-    /// The instance's recorded modified times, which this lock protects, or `None` where the
-    /// instance keeps them in the mutable store. Written back by the context's flush, before
-    /// the lock is released.
+    /// The instance's recorded modified times, the set its mount shares
+    /// ([`crate::records::InstanceRecords::open_canonical`]), or `None` where the instance keeps
+    /// them in the mutable store. Written back by the context's flush, before the lock is
+    /// released.
     records: Option<Arc<crate::records::InstanceRecords>>,
     /// Declared before the store locks so it drops before them. Rust drops fields in declaration order,
     /// so the repository flock is released before the store locks that contain
@@ -2111,7 +2112,7 @@ pub(crate) struct RepositoryLock {
 }
 
 impl RepositoryLock {
-    /// The instance's recorded modified times, which this lock protects, or `None` where the
+    /// The instance's recorded modified times, the set its mount shares, or `None` where the
     /// instance keeps them in the mutable store.
     pub(crate) fn records(&self) -> Option<&Arc<crate::records::InstanceRecords>> {
         self.records.as_ref()
@@ -2128,7 +2129,7 @@ impl RepositoryLock {
         token: &RepositoryWriteToken,
     ) -> std::io::Result<()> {
         match &self.records {
-            Some(records) => records.write_back(token, Arc::clone(self)).await,
+            Some(records) => records.write_back(token, false, Arc::clone(self)).await,
             None => Ok(()),
         }
     }
@@ -2444,7 +2445,7 @@ pub(crate) async fn get_or_create_repository_lock(
         .internal("Failed to get exclusive access to repository")?;
 
     let records = if instance_records {
-        Some(crate::records::InstanceRecords::open(&dot_path).await)
+        Some(crate::records::InstanceRecords::open_canonical(&key).await)
     } else {
         None
     };

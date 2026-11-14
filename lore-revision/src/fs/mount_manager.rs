@@ -5,6 +5,7 @@
 //! FUSE. This one holds both, finds every registered instance once as the service starts and hands
 //! each to its manager, and answers what is mounted at a path, whichever VFS mounted it.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -64,6 +65,10 @@ struct PendingFuseMount;
 /// The mounts a start made of its registered SWFS instances, not yet ready, by path.
 type FoundSwfsMounts = Vec<(MountPath, InstanceId, Arc<SwfsInterface>)>;
 
+/// The instances registered in the shared stores a start found, `None` where a store could not be
+/// opened or listed, so some are unknown.
+type RegisteredInstances = Option<BTreeSet<InstanceId>>;
+
 pub struct MountManager {
     swfs: SwfsMountManager,
     #[cfg(target_os = "linux")]
@@ -72,21 +77,24 @@ pub struct MountManager {
 
 impl MountManager {
     /// Mounts the SWFS instances of every store in `entries` and finds its FUSE instances, which
-    /// are mounted once the manager exists. A store that cannot be opened or listed, and an
-    /// instance whose external directory or config cannot be read, are logged and skipped rather
-    /// than stopping the rest.
+    /// are mounted once the manager exists, and the instances registered in them. A store that
+    /// cannot be opened or listed, and an instance whose external directory or config cannot be
+    /// read, are logged and skipped rather than stopping the rest.
     #[lore_macro::test_pub]
     async fn mounts_of_entries(
         entries: &[SharedStoreRegistryEntry],
-    ) -> Result<(FoundSwfsMounts, Vec<PendingFuseMount>), MountManagerError> {
+    ) -> Result<(FoundSwfsMounts, Vec<PendingFuseMount>, RegisteredInstances), MountManagerError>
+    {
         let mut swfs = Vec::new();
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut pending_fuse = Vec::new();
+        let mut registered = Some(BTreeSet::new());
         for entry in entries {
             let entry_repository = match entry.create_null_repository_context().await {
                 Ok(repository) => repository,
                 Err(error) => {
                     lore_warn!("Unable to open shared store at {}: {error}", entry.path());
+                    registered = None;
                     continue;
                 }
             };
@@ -97,9 +105,13 @@ impl MountManager {
                         "Unable to list instances of shared store at {}: {error}",
                         entry.path()
                     );
+                    registered = None;
                     continue;
                 }
             };
+            if let Some(registered) = &mut registered {
+                registered.extend(instances.iter().map(|instance| instance.instance_id));
+            }
             for instance in &instances {
                 let dot_lore = match check_for_external_lore_dir(instance.instance_id) {
                     Ok(Some(dot_lore)) => dot_lore,
@@ -157,14 +169,21 @@ impl MountManager {
                 }
             }
         }
-        Ok((swfs, pending_fuse))
+        Ok((swfs, pending_fuse, registered))
     }
 
     pub async fn initialize() -> Result<Arc<Self>, MountManagerError> {
         let registry = SharedStoreRegistry::load()
             .await
             .forward::<MountManagerError>("Unable to load shared store registry")?;
-        let (swfs, pending_fuse) = Self::mounts_of_entries(registry.entries()).await?;
+        let (swfs, pending_fuse, registered) = Self::mounts_of_entries(registry.entries()).await?;
+        #[cfg(target_os = "linux")]
+        Box::pin(crate::fs::fuse::mount_manager::remove_interrupted_clones(
+            registered.as_ref(),
+        ))
+        .await;
+        #[cfg(not(target_os = "linux"))]
+        let _ = registered;
         let manager = Arc::new(MountManager {
             swfs: SwfsMountManager::with_mounts(swfs).await?,
             #[cfg(target_os = "linux")]
